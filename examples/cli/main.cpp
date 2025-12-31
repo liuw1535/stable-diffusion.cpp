@@ -3,6 +3,7 @@
 #include <time.h>
 #include <cctype>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -421,28 +422,29 @@ bool save_results(const SDCliParams& cli_params,
         std::string params = get_image_params(cli_params, ctx_params, gen_params, gen_params.seed + idx);
         int ok             = 0;
         
-        // Encrypt if password is provided
-        uint8_t* data_to_write = img.data;
-        uint8_t* encrypted_data = nullptr;
-        if (!cli_params.encrypt_password.empty()) {
-            size_t data_size = img.width * img.height * img.channel;
-            encrypted_data = (uint8_t*)malloc(data_size);
-            if (encrypted_data) {
-                memcpy(encrypted_data, img.data, data_size);
-                ImageCrypto crypto(cli_params.encrypt_password);
-                crypto.encrypt(encrypted_data, data_size);
-                data_to_write = encrypted_data;
-            }
-        }
-        
         if (is_jpg) {
-            ok = stbi_write_jpg(path.string().c_str(), img.width, img.height, img.channel, data_to_write, 90, params.c_str());
+            ok = stbi_write_jpg(path.string().c_str(), img.width, img.height, img.channel, img.data, 90, params.c_str());
         } else {
-            ok = stbi_write_png(path.string().c_str(), img.width, img.height, img.channel, data_to_write, 0, params.c_str());
+            ok = stbi_write_png(path.string().c_str(), img.width, img.height, img.channel, img.data, 0, params.c_str());
         }
         
-        if (encrypted_data) {
-            free(encrypted_data);
+        // Encrypt file after writing if password is provided
+        if (ok && !cli_params.encrypt_password.empty()) {
+            std::ifstream file(path, std::ios::binary | std::ios::ate);
+            if (file) {
+                size_t size = file.tellg();
+                file.seekg(0);
+                std::vector<uint8_t> buffer(size);
+                file.read(reinterpret_cast<char*>(buffer.data()), size);
+                file.close();
+                
+                ImageCrypto crypto(cli_params.encrypt_password);
+                crypto.encrypt(buffer.data(), size);
+                
+                std::ofstream out(path, std::ios::binary);
+                out.write(reinterpret_cast<const char*>(buffer.data()), size);
+                out.close();
+            }
         }
         
         LOG_INFO("save result image %d to '%s' (%s%s)", idx, path.string().c_str(), 
