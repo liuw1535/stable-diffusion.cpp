@@ -18,6 +18,7 @@
 #include "common/common.hpp"
 
 #include "avi_writer.h"
+#include "../../image_crypto.hpp"
 
 const char* previews_str[] = {
     "none",
@@ -46,6 +47,7 @@ struct SDCliParams {
     bool color               = false;
 
     bool normal_exit = false;
+    std::string encrypt_password = "";
 
     ArgOptions get_options() {
         ArgOptions options;
@@ -59,6 +61,10 @@ struct SDCliParams {
              "--preview-path",
              "path to write preview image to (default: ./preview.png)",
              &preview_path},
+            {"",
+             "--encrypt",
+             "password to encrypt output images (leave empty for no encryption)",
+             &encrypt_password},
         };
 
         options.int_options = {
@@ -192,7 +198,8 @@ struct SDCliParams {
             << "  preview_path: \"" << preview_path << "\",\n"
             << "  preview_fps: " << preview_fps << ",\n"
             << "  taesd_preview: " << (taesd_preview ? "true" : "false") << ",\n"
-            << "  preview_noisy: " << (preview_noisy ? "true" : "false") << "\n"
+            << "  preview_noisy: " << (preview_noisy ? "true" : "false") << ",\n"
+            << "  encrypt_password: " << (encrypt_password.empty() ? "(none)" : "***") << "\n"
             << "}";
         return oss.str();
     }
@@ -413,12 +420,34 @@ bool save_results(const SDCliParams& cli_params,
 
         std::string params = get_image_params(cli_params, ctx_params, gen_params, gen_params.seed + idx);
         int ok             = 0;
-        if (is_jpg) {
-            ok = stbi_write_jpg(path.string().c_str(), img.width, img.height, img.channel, img.data, 90, params.c_str());
-        } else {
-            ok = stbi_write_png(path.string().c_str(), img.width, img.height, img.channel, img.data, 0, params.c_str());
+        
+        // Encrypt if password is provided
+        uint8_t* data_to_write = img.data;
+        uint8_t* encrypted_data = nullptr;
+        if (!cli_params.encrypt_password.empty()) {
+            size_t data_size = img.width * img.height * img.channel;
+            encrypted_data = (uint8_t*)malloc(data_size);
+            if (encrypted_data) {
+                memcpy(encrypted_data, img.data, data_size);
+                ImageCrypto crypto(cli_params.encrypt_password);
+                crypto.encrypt(encrypted_data, data_size);
+                data_to_write = encrypted_data;
+            }
         }
-        LOG_INFO("save result image %d to '%s' (%s)", idx, path.string().c_str(), ok ? "success" : "failure");
+        
+        if (is_jpg) {
+            ok = stbi_write_jpg(path.string().c_str(), img.width, img.height, img.channel, data_to_write, 90, params.c_str());
+        } else {
+            ok = stbi_write_png(path.string().c_str(), img.width, img.height, img.channel, data_to_write, 0, params.c_str());
+        }
+        
+        if (encrypted_data) {
+            free(encrypted_data);
+        }
+        
+        LOG_INFO("save result image %d to '%s' (%s%s)", idx, path.string().c_str(), 
+                 ok ? "success" : "failure",
+                 !cli_params.encrypt_password.empty() ? ", encrypted" : "");
     };
 
     if (std::regex_search(cli_params.output_path, format_specifier_regex)) {
