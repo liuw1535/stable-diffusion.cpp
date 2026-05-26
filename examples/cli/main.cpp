@@ -353,6 +353,99 @@ bool load_images_from_dir(const std::string dir,
     return true;
 }
 
+static void encrypt_buffer(std::vector<uint8_t>& buffer, const std::string& password) {
+    if (password.empty()) {
+        return;
+    }
+
+    ImageCrypto crypto(password);
+    crypto.encrypt(buffer.data(), buffer.size());
+}
+
+static bool write_binary_file(const fs::path& path, const std::vector<uint8_t>& buffer) {
+    std::ofstream out(path, std::ios::binary);
+    if (!out) {
+        LOG_ERROR("failed to open file '%s' for writing", path.string().c_str());
+        return false;
+    }
+
+    if (!buffer.empty()) {
+        out.write(reinterpret_cast<const char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
+    }
+    if (!out) {
+        LOG_ERROR("failed to write file '%s'", path.string().c_str());
+        return false;
+    }
+
+    return true;
+}
+
+static bool encrypt_file_in_place(const fs::path& path, const std::string& password) {
+    if (password.empty()) {
+        return true;
+    }
+
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) {
+        LOG_ERROR("failed to open file '%s' for encryption", path.string().c_str());
+        return false;
+    }
+
+    const std::streampos end_pos = file.tellg();
+    if (end_pos < 0) {
+        LOG_ERROR("failed to read file size for encryption: '%s'", path.string().c_str());
+        return false;
+    }
+
+    std::vector<uint8_t> buffer(static_cast<size_t>(end_pos));
+    file.seekg(0);
+    if (!buffer.empty()) {
+        const std::streamsize bytes_to_read = static_cast<std::streamsize>(buffer.size());
+        file.read(reinterpret_cast<char*>(buffer.data()), bytes_to_read);
+        if (file.gcount() != bytes_to_read) {
+            LOG_ERROR("failed to read file '%s' for encryption", path.string().c_str());
+            return false;
+        }
+    }
+    file.close();
+
+    encrypt_buffer(buffer, password);
+    return write_binary_file(path, buffer);
+}
+
+static bool write_preview_image_to_file(const SDCliParams& cli_params, const sd_image_t& image) {
+    if (image.data == nullptr || image.width == 0 || image.height == 0 || image.channel == 0) {
+        return false;
+    }
+
+    const EncodedImageFormat format = encoded_image_format_from_path(cli_params.preview_path);
+    std::vector<uint8_t> buffer     = encode_image_to_vector(format,
+                                                             image.data,
+                                                             static_cast<int>(image.width),
+                                                             static_cast<int>(image.height),
+                                                             static_cast<int>(image.channel));
+    if (buffer.empty()) {
+        return false;
+    }
+
+    encrypt_buffer(buffer, cli_params.encrypt_password);
+    return write_binary_file(cli_params.preview_path, buffer);
+}
+
+static bool write_preview_video_to_file(const SDCliParams& cli_params, sd_image_t* images, int frame_count) {
+    std::string ext = fs::path(cli_params.preview_path).extension().string();
+    std::vector<uint8_t> buffer = create_video_from_sd_images_to_vector(ext,
+                                                                        images,
+                                                                        frame_count,
+                                                                        cli_params.preview_fps);
+    if (buffer.empty()) {
+        return false;
+    }
+
+    encrypt_buffer(buffer, cli_params.encrypt_password);
+    return write_binary_file(cli_params.preview_path, buffer);
+}
+
 void step_callback(int step, int frame_count, sd_image_t* image, bool is_noisy, void* data) {
     (void)step;
     (void)is_noisy;
@@ -360,15 +453,11 @@ void step_callback(int step, int frame_count, sd_image_t* image, bool is_noisy, 
     // is_noisy is set to true if the preview corresponds to noisy latents, false if it's denoised latents
     // unused in this app, it will either be always noisy or always denoised here
     if (frame_count == 1) {
-        if (!write_image_to_file(cli_params->preview_path,
-                                 image->data,
-                                 image->width,
-                                 image->height,
-                                 image->channel)) {
+        if (!write_preview_image_to_file(*cli_params, *image)) {
             LOG_ERROR("save preview image to '%s' failed", cli_params->preview_path.c_str());
         }
     } else {
-        if (create_video_from_sd_images(cli_params->preview_path.c_str(), image, frame_count, cli_params->preview_fps) != 0) {
+        if (!write_preview_video_to_file(*cli_params, image, frame_count)) {
             LOG_ERROR("save preview video to '%s' failed", cli_params->preview_path.c_str());
         }
     }
@@ -468,49 +557,8 @@ bool save_results(const SDCliParams& cli_params,
                                           : "";
         bool ok                     = write_image_to_file(path.string(), img.data, img.width, img.height, img.channel, params, 90);
 
-        if (ok && !cli_params.encrypt_password.empty()) {
-            std::ifstream file(path, std::ios::binary | std::ios::ate);
-            if (!file) {
-                LOG_ERROR("failed to open image '%s' for encryption", path.string().c_str());
-                ok = false;
-            } else {
-                const std::streampos end_pos = file.tellg();
-                if (end_pos < 0) {
-                    LOG_ERROR("failed to read image size for encryption: '%s'", path.string().c_str());
-                    ok = false;
-                } else {
-                    std::vector<uint8_t> buffer(static_cast<size_t>(end_pos));
-                    file.seekg(0);
-                    if (!buffer.empty()) {
-                        const std::streamsize bytes_to_read = static_cast<std::streamsize>(buffer.size());
-                        file.read(reinterpret_cast<char*>(buffer.data()), bytes_to_read);
-                        if (file.gcount() != bytes_to_read) {
-                            LOG_ERROR("failed to read image '%s' for encryption", path.string().c_str());
-                            ok = false;
-                        }
-                    }
-                    file.close();
-
-                    if (ok) {
-                        ImageCrypto crypto(cli_params.encrypt_password);
-                        crypto.encrypt(buffer.data(), buffer.size());
-
-                        std::ofstream out(path, std::ios::binary);
-                        if (!out) {
-                            LOG_ERROR("failed to open image '%s' for encrypted output", path.string().c_str());
-                            ok = false;
-                        } else {
-                            if (!buffer.empty()) {
-                                out.write(reinterpret_cast<const char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
-                            }
-                            ok = static_cast<bool>(out);
-                            if (!ok) {
-                                LOG_ERROR("failed to write encrypted image '%s'", path.string().c_str());
-                            }
-                        }
-                    }
-                }
-            }
+        if (ok) {
+            ok = encrypt_file_in_place(path, cli_params.encrypt_password);
         }
 
         LOG_INFO("save result image %d to '%s' (%s%s)",
