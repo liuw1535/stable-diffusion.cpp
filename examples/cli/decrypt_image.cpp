@@ -2,7 +2,7 @@
 #include <fstream>
 #include <vector>
 #include <cstring>
-#include "../image_crypto.hpp"
+#include "image_crypto.hpp"
 
 int main(int argc, char* argv[]) {
     if (argc != 4) {

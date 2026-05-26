@@ -499,9 +499,15 @@ namespace Anima {
                 encoder_hidden_states = adapted_context;
             }
 
+            sd::ggml_graph_cut::mark_graph_cut(x, "anima.prelude", "x");
+            sd::ggml_graph_cut::mark_graph_cut(embedded_timestep, "anima.prelude", "embedded_timestep");
+            sd::ggml_graph_cut::mark_graph_cut(temb, "anima.prelude", "temb");
+            sd::ggml_graph_cut::mark_graph_cut(encoder_hidden_states, "anima.prelude", "context");
+
             for (int i = 0; i < num_layers; i++) {
                 auto block = std::dynamic_pointer_cast<TransformerBlock>(blocks["blocks." + std::to_string(i)]);
                 x          = block->forward(ctx, x, encoder_hidden_states, embedded_timestep, temb, image_pe);
+                sd::ggml_graph_cut::mark_graph_cut(x, "anima.blocks." + std::to_string(i), "x");
             }
 
             x = final_layer->forward(ctx, x, embedded_timestep, temb);  // [N, h*w, ph*pw*C]
@@ -520,10 +526,10 @@ namespace Anima {
         AnimaNet net;
 
         AnimaRunner(ggml_backend_t backend,
-                    bool offload_params_to_cpu,
+                    ggml_backend_t params_backend,
                     const String2TensorStorage& tensor_storage_map = {},
                     const std::string prefix                       = "model.diffusion_model")
-            : GGMLRunner(backend, offload_params_to_cpu) {
+            : GGMLRunner(backend, params_backend) {
             int64_t num_layers    = 0;
             std::string layer_tag = prefix + ".net.blocks.";
             for (const auto& kv : tensor_storage_map) {
@@ -592,7 +598,8 @@ namespace Anima {
                                           {},
                                           empty_ref_latents,
                                           false,
-                                          1.0f);
+                                          1.0f,
+                                          false);
 
             std::vector<float> axis_thetas = {
                 static_cast<float>(theta) * calc_ntk_factor(t_extrapolation_ratio, axes_dim[0]),
@@ -602,19 +609,18 @@ namespace Anima {
             return Rope::embed_nd(ids, bs, axis_thetas, axes_dim);
         }
 
-        ggml_cgraph* build_graph(ggml_tensor* x,
-                                 ggml_tensor* timesteps,
-                                 ggml_tensor* context,
-                                 ggml_tensor* t5_ids     = nullptr,
-                                 ggml_tensor* t5_weights = nullptr) {
+        ggml_cgraph* build_graph(const sd::Tensor<float>& x_tensor,
+                                 const sd::Tensor<float>& timesteps_tensor,
+                                 const sd::Tensor<float>& context_tensor    = {},
+                                 const sd::Tensor<int32_t>& t5_ids_tensor   = {},
+                                 const sd::Tensor<float>& t5_weights_tensor = {}) {
+            ggml_tensor* x          = make_input(x_tensor);
+            ggml_tensor* timesteps  = make_input(timesteps_tensor);
+            ggml_tensor* context    = make_optional_input(context_tensor);
+            ggml_tensor* t5_ids     = make_optional_input(t5_ids_tensor);
+            ggml_tensor* t5_weights = make_optional_input(t5_weights_tensor);
             GGML_ASSERT(x->ne[3] == 1);
             ggml_cgraph* gf = new_graph_custom(ANIMA_GRAPH_SIZE);
-
-            x          = to_backend(x);
-            timesteps  = to_backend(timesteps);
-            context    = to_backend(context);
-            t5_ids     = to_backend(t5_ids);
-            t5_weights = to_backend(t5_weights);
 
             int64_t pad_h = (net.patch_size - x->ne[1] % net.patch_size) % net.patch_size;
             int64_t pad_w = (net.patch_size - x->ne[0] % net.patch_size) % net.patch_size;
@@ -667,18 +673,16 @@ namespace Anima {
             return gf;
         }
 
-        bool compute(int n_threads,
-                     ggml_tensor* x,
-                     ggml_tensor* timesteps,
-                     ggml_tensor* context,
-                     ggml_tensor* t5_ids      = nullptr,
-                     ggml_tensor* t5_weights  = nullptr,
-                     ggml_tensor** output     = nullptr,
-                     ggml_context* output_ctx = nullptr) {
+        sd::Tensor<float> compute(int n_threads,
+                                  const sd::Tensor<float>& x,
+                                  const sd::Tensor<float>& timesteps,
+                                  const sd::Tensor<float>& context    = {},
+                                  const sd::Tensor<int32_t>& t5_ids   = {},
+                                  const sd::Tensor<float>& t5_weights = {}) {
             auto get_graph = [&]() -> ggml_cgraph* {
                 return build_graph(x, timesteps, context, t5_ids, t5_weights);
             };
-            return GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx);
+            return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false), x.dim());
         }
     };
 }  // namespace Anima

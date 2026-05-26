@@ -7,6 +7,11 @@
 #include "ggml_extend.hpp"
 
 namespace Rope {
+    enum class EmbedNDLayout {
+        Matrix,
+        ErnieImage,
+    };
+
     template <class T>
     __STATIC_INLINE__ std::vector<T> linspace(T start, T end, int num) {
         std::vector<T> result(num);
@@ -106,6 +111,16 @@ namespace Rope {
         return txt_ids;
     }
 
+    __STATIC_INLINE__ std::vector<std::vector<float>> gen_longcat_txt_ids(int bs, int context_len, int axes_dim_num) {
+        auto txt_ids = std::vector<std::vector<float>>(bs * context_len, std::vector<float>(axes_dim_num, 0.0f));
+        for (int i = 0; i < bs * context_len; i++) {
+            float token_index = static_cast<float>(i % context_len);
+            txt_ids[i][1]     = token_index;
+            txt_ids[i][2]     = token_index;
+        }
+        return txt_ids;
+    }
+
     __STATIC_INLINE__ std::vector<std::vector<float>> gen_flux_img_ids(int h,
                                                                        int w,
                                                                        int patch_size,
@@ -117,7 +132,6 @@ namespace Rope {
                                                                        bool scale_rope = false) {
         int h_len = (h + (patch_size / 2)) / patch_size;
         int w_len = (w + (patch_size / 2)) / patch_size;
-
         std::vector<std::vector<float>> img_ids(h_len * w_len, std::vector<float>(axes_dim_num, 0.0));
 
         int h_start = h_offset;
@@ -130,7 +144,6 @@ namespace Rope {
 
         std::vector<float> row_ids = linspace<float>(1.f * h_start, 1.f * h_start + h_len - 1, h_len);
         std::vector<float> col_ids = linspace<float>(1.f * w_start, 1.f * w_start + w_len - 1, w_len);
-
         for (int i = 0; i < h_len; ++i) {
             for (int j = 0; j < w_len; ++j) {
                 img_ids[i * w_len + j][0] = 1.f * index;
@@ -169,7 +182,8 @@ namespace Rope {
                                                   int bs,
                                                   const std::vector<float>& axis_thetas,
                                                   const std::vector<int>& axes_dim,
-                                                  const std::vector<std::vector<int>>& wrap_dims = {}) {
+                                                  const std::vector<std::vector<int>>& wrap_dims = {},
+                                                  EmbedNDLayout layout                           = EmbedNDLayout::Matrix) {
         std::vector<std::vector<float>> trans_ids = transpose(ids);
         size_t pos_len                            = ids.size() / bs;
         size_t num_axes                           = axes_dim.size();
@@ -204,6 +218,24 @@ namespace Rope {
             offset += rope_emb[0].size();
         }
 
+        if (layout == EmbedNDLayout::ErnieImage) {
+            int head_dim = emb_dim * 2;
+            std::vector<float> ernie_emb(bs * pos_len * head_dim * 2, 0.0f);
+            for (size_t pos_idx = 0; pos_idx < bs * pos_len; ++pos_idx) {
+                for (int i = 0; i < emb_dim; ++i) {
+                    float cos_val             = emb[pos_idx][4 * i];
+                    float sin_val             = emb[pos_idx][4 * i + 2];
+                    size_t cos_offset         = pos_idx * head_dim + 2 * i;
+                    size_t sin_offset         = bs * pos_len * head_dim + cos_offset;
+                    ernie_emb[cos_offset]     = cos_val;
+                    ernie_emb[cos_offset + 1] = cos_val;
+                    ernie_emb[sin_offset]     = sin_val;
+                    ernie_emb[sin_offset + 1] = sin_val;
+                }
+            }
+            return ernie_emb;
+        }
+
         return flatten(emb);
     }
 
@@ -211,22 +243,25 @@ namespace Rope {
                                                   int bs,
                                                   float theta,
                                                   const std::vector<int>& axes_dim,
-                                                  const std::vector<std::vector<int>>& wrap_dims = {}) {
+                                                  const std::vector<std::vector<int>>& wrap_dims = {},
+                                                  EmbedNDLayout layout                           = EmbedNDLayout::Matrix) {
         std::vector<float> axis_thetas(axes_dim.size(), theta);
-        return embed_nd(ids, bs, axis_thetas, axes_dim, wrap_dims);
+        return embed_nd(ids, bs, axis_thetas, axes_dim, wrap_dims, layout);
     }
 
     __STATIC_INLINE__ std::vector<std::vector<float>> gen_refs_ids(int patch_size,
                                                                    int bs,
                                                                    int axes_dim_num,
+                                                                   int start_index,
                                                                    const std::vector<ggml_tensor*>& ref_latents,
                                                                    bool increase_ref_index,
                                                                    float ref_index_scale,
-                                                                   bool scale_rope) {
+                                                                   bool scale_rope,
+                                                                   int base_offset = 0) {
         std::vector<std::vector<float>> ids;
         int curr_h_offset = 0;
         int curr_w_offset = 0;
-        int index         = 1;
+        int index         = start_index;
         for (ggml_tensor* ref : ref_latents) {
             int h_offset = 0;
             int w_offset = 0;
@@ -245,8 +280,8 @@ namespace Rope {
                                             bs,
                                             axes_dim_num,
                                             static_cast<int>(index * ref_index_scale),
-                                            h_offset,
-                                            w_offset,
+                                            h_offset + base_offset,
+                                            w_offset + base_offset,
                                             scale_rope);
             ids          = concat_ids(ids, ref_ids, bs);
 
@@ -269,13 +304,17 @@ namespace Rope {
                                                                    std::set<int> txt_arange_dims,
                                                                    const std::vector<ggml_tensor*>& ref_latents,
                                                                    bool increase_ref_index,
-                                                                   float ref_index_scale) {
-        auto txt_ids = gen_flux_txt_ids(bs, context_len, axes_dim_num, txt_arange_dims);
-        auto img_ids = gen_flux_img_ids(h, w, patch_size, bs, axes_dim_num);
+                                                                   float ref_index_scale,
+                                                                   bool is_longcat) {
+        int x_index = is_longcat ? 1 : 0;
+
+        auto txt_ids = is_longcat ? gen_longcat_txt_ids(bs, context_len, axes_dim_num) : gen_flux_txt_ids(bs, context_len, axes_dim_num, txt_arange_dims);
+        int offset   = is_longcat ? context_len : 0;
+        auto img_ids = gen_flux_img_ids(h, w, patch_size, bs, axes_dim_num, x_index, offset, offset);
 
         auto ids = concat_ids(txt_ids, img_ids, bs);
         if (ref_latents.size() > 0) {
-            auto refs_ids = gen_refs_ids(patch_size, bs, axes_dim_num, ref_latents, increase_ref_index, ref_index_scale, false);
+            auto refs_ids = gen_refs_ids(patch_size, bs, axes_dim_num, x_index + 1, ref_latents, increase_ref_index, ref_index_scale, false, offset);
             ids           = concat_ids(ids, refs_ids, bs);
         }
         return ids;
@@ -294,7 +333,8 @@ namespace Rope {
                                                      int theta,
                                                      bool circular_h,
                                                      bool circular_w,
-                                                     const std::vector<int>& axes_dim) {
+                                                     const std::vector<int>& axes_dim,
+                                                     bool is_longcat) {
         std::vector<std::vector<float>> ids = gen_flux_ids(h,
                                                            w,
                                                            patch_size,
@@ -304,7 +344,8 @@ namespace Rope {
                                                            txt_arange_dims,
                                                            ref_latents,
                                                            increase_ref_index,
-                                                           ref_index_scale);
+                                                           ref_index_scale,
+                                                           is_longcat);
         std::vector<std::vector<int>> wrap_dims;
         if ((circular_h || circular_w) && bs > 0 && axes_dim.size() >= 3) {
             int h_len = (h + (patch_size / 2)) / patch_size;
@@ -369,7 +410,7 @@ namespace Rope {
         auto img_ids     = gen_flux_img_ids(h, w, patch_size, bs, axes_dim_num, 0, 0, 0, true);
         auto ids         = concat_ids(txt_ids_repeated, img_ids, bs);
         if (ref_latents.size() > 0) {
-            auto refs_ids = gen_refs_ids(patch_size, bs, axes_dim_num, ref_latents, increase_ref_index, 1.f, true);
+            auto refs_ids = gen_refs_ids(patch_size, bs, axes_dim_num, 1, ref_latents, increase_ref_index, 1.f, true);
             ids           = concat_ids(ids, refs_ids, bs);
         }
         return ids;
@@ -435,6 +476,74 @@ namespace Rope {
             }
         }
         return embed_nd(ids, bs, static_cast<float>(theta), axes_dim, wrap_dims);
+    }
+
+    __STATIC_INLINE__ std::vector<std::vector<float>> gen_ernie_image_ids(int h,
+                                                                          int w,
+                                                                          int patch_size,
+                                                                          int bs,
+                                                                          int context_len) {
+        int h_len = h / patch_size;
+        int w_len = w / patch_size;
+
+        std::vector<std::vector<float>> img_ids(h_len * w_len, std::vector<float>(3, 0.0f));
+        std::vector<float> h_ids = linspace<float>(0.f, static_cast<float>(h_len - 1), h_len);
+        std::vector<float> w_ids = linspace<float>(0.f, static_cast<float>(w_len - 1), w_len);
+        for (int i = 0; i < h_len; ++i) {
+            for (int j = 0; j < w_len; ++j) {
+                img_ids[i * w_len + j][0] = static_cast<float>(context_len);
+                img_ids[i * w_len + j][1] = h_ids[i];
+                img_ids[i * w_len + j][2] = w_ids[j];
+            }
+        }
+
+        std::vector<std::vector<float>> img_ids_repeated(bs * img_ids.size(), std::vector<float>(3, 0.0f));
+        for (int i = 0; i < bs; ++i) {
+            for (int j = 0; j < static_cast<int>(img_ids.size()); ++j) {
+                img_ids_repeated[i * img_ids.size() + j] = img_ids[j];
+            }
+        }
+
+        std::vector<std::vector<float>> txt_ids(bs * context_len, std::vector<float>(3, 0.0f));
+        for (int i = 0; i < bs; ++i) {
+            for (int j = 0; j < context_len; ++j) {
+                txt_ids[i * context_len + j][0] = static_cast<float>(j);
+            }
+        }
+
+        return concat_ids(img_ids_repeated, txt_ids, bs);
+    }
+
+    __STATIC_INLINE__ std::vector<float> gen_ernie_image_pe(int h,
+                                                            int w,
+                                                            int patch_size,
+                                                            int bs,
+                                                            int context_len,
+                                                            int theta,
+                                                            bool circular_h,
+                                                            bool circular_w,
+                                                            const std::vector<int>& axes_dim) {
+        std::vector<std::vector<float>> ids = gen_ernie_image_ids(h, w, patch_size, bs, context_len);
+        std::vector<std::vector<int>> wrap_dims;
+        if ((circular_h || circular_w) && bs > 0 && axes_dim.size() >= 3) {
+            int h_len = h / patch_size;
+            int w_len = w / patch_size;
+            if (h_len > 0 && w_len > 0) {
+                size_t pos_len = ids.size() / bs;
+                wrap_dims.assign(axes_dim.size(), std::vector<int>(pos_len, 0));
+                const size_t img_tokens = static_cast<size_t>(h_len) * static_cast<size_t>(w_len);
+                for (size_t token_i = 0; token_i < img_tokens; ++token_i) {
+                    if (circular_h) {
+                        wrap_dims[1][token_i] = h_len;
+                    }
+                    if (circular_w) {
+                        wrap_dims[2][token_i] = w_len;
+                    }
+                }
+            }
+        }
+
+        return embed_nd(ids, bs, static_cast<float>(theta), axes_dim, wrap_dims, EmbedNDLayout::ErnieImage);
     }
 
     __STATIC_INLINE__ std::vector<std::vector<float>> gen_vid_ids(int t,

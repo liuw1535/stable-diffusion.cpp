@@ -446,7 +446,6 @@ namespace Flux {
             if (use_yak_mlp || use_mlp_silu_act) {
                 mlp_mult_factor = 2;
             }
-
             blocks["linear1"]  = std::shared_ptr<GGMLBlock>(new Linear(hidden_size, hidden_size * 3 + mlp_hidden_dim * mlp_mult_factor, mlp_proj_bias));
             blocks["linear2"]  = std::shared_ptr<GGMLBlock>(new Linear(hidden_size + mlp_hidden_dim, hidden_size, mlp_proj_bias));
             blocks["norm"]     = std::shared_ptr<GGMLBlock>(new QKNorm(head_dim));
@@ -928,6 +927,9 @@ namespace Flux {
             }
 
             txt = txt_in->forward(ctx, txt);
+            sd::ggml_graph_cut::mark_graph_cut(img, "flux.prelude", "img");
+            sd::ggml_graph_cut::mark_graph_cut(txt, "flux.prelude", "txt");
+            sd::ggml_graph_cut::mark_graph_cut(vec, "flux.prelude", "vec");
 
             for (int i = 0; i < params.depth; i++) {
                 if (skip_layers.size() > 0 && std::find(skip_layers.begin(), skip_layers.end(), i) != skip_layers.end()) {
@@ -939,6 +941,8 @@ namespace Flux {
                 auto img_txt = block->forward(ctx, img, txt, vec, pe, txt_img_mask, ds_img_mods, ds_txt_mods);
                 img          = img_txt.first;   // [N, n_img_token, hidden_size]
                 txt          = img_txt.second;  // [N, n_txt_token, hidden_size]
+                sd::ggml_graph_cut::mark_graph_cut(img, "flux.double_blocks." + std::to_string(i), "img");
+                sd::ggml_graph_cut::mark_graph_cut(txt, "flux.double_blocks." + std::to_string(i), "txt");
             }
 
             auto txt_img = ggml_concat(ctx->ggml_ctx, txt, img, 1);  // [N, n_txt_token + n_img_token, hidden_size]
@@ -949,6 +953,7 @@ namespace Flux {
                 auto block = std::dynamic_pointer_cast<SingleStreamBlock>(blocks["single_blocks." + std::to_string(i)]);
 
                 txt_img = block->forward(ctx, txt_img, vec, pe, txt_img_mask, ss_mods);
+                sd::ggml_graph_cut::mark_graph_cut(txt_img, "flux.single_blocks." + std::to_string(i), "txt_img");
             }
 
             img = ggml_view_3d(ctx->ggml_ctx,
@@ -1178,16 +1183,17 @@ namespace Flux {
         std::vector<float> pe_vec;
         std::vector<float> mod_index_arange_vec;
         std::vector<float> dct_vec;
+        sd::Tensor<float> guidance_tensor;
         SDVersion version;
         bool use_mask = false;
 
         FluxRunner(ggml_backend_t backend,
-                   bool offload_params_to_cpu,
+                   ggml_backend_t params_backend,
                    const String2TensorStorage& tensor_storage_map = {},
                    const std::string prefix                       = "",
                    SDVersion version                              = VERSION_FLUX,
                    bool use_mask                                  = false)
-            : GGMLRunner(backend, offload_params_to_cpu), version(version), use_mask(use_mask) {
+            : GGMLRunner(backend, params_backend), version(version), use_mask(use_mask) {
             flux_params.version             = version;
             flux_params.guidance_embed      = false;
             flux_params.depth               = 0;
@@ -1218,6 +1224,9 @@ namespace Flux {
                 flux_params.share_modulation = true;
                 flux_params.ref_index_scale  = 10.f;
                 flux_params.use_mlp_silu_act = true;
+            } else if (sd_version_is_longcat(version)) {
+                flux_params.context_in_dim = 3584;
+                flux_params.vec_in_dim     = 0;
             }
             int64_t head_dim                   = 0;
             int64_t actual_radiance_patch_size = -1;
@@ -1353,29 +1362,42 @@ namespace Flux {
             return dct;
         }
 
-        ggml_cgraph* build_graph(ggml_tensor* x,
-                                 ggml_tensor* timesteps,
-                                 ggml_tensor* context,
-                                 ggml_tensor* c_concat,
-                                 ggml_tensor* y,
-                                 ggml_tensor* guidance,
-                                 std::vector<ggml_tensor*> ref_latents = {},
-                                 bool increase_ref_index               = false,
-                                 std::vector<int> skip_layers          = {}) {
+        ggml_cgraph* build_graph(const sd::Tensor<float>& x_tensor,
+                                 const sd::Tensor<float>& timesteps_tensor,
+                                 const sd::Tensor<float>& context_tensor                  = {},
+                                 const sd::Tensor<float>& c_concat_tensor                 = {},
+                                 const sd::Tensor<float>& y_tensor                        = {},
+                                 const sd::Tensor<float>& guidance_tensor                 = {},
+                                 const std::vector<sd::Tensor<float>>& ref_latents_tensor = {},
+                                 bool increase_ref_index                                  = false,
+                                 std::vector<int> skip_layers                             = {}) {
+            ggml_tensor* x         = make_input(x_tensor);
+            ggml_tensor* timesteps = make_input(timesteps_tensor);
+            ggml_tensor* context   = make_optional_input(context_tensor);
+            ggml_tensor* c_concat  = make_optional_input(c_concat_tensor);
+            ggml_tensor* y         = make_optional_input(y_tensor);
+            if (flux_params.guidance_embed || flux_params.is_chroma) {
+                if (!guidance_tensor.empty()) {
+                    this->guidance_tensor = guidance_tensor;
+                    if (flux_params.is_chroma) {
+                        this->guidance_tensor.fill_(0.f);
+                    }
+                }
+            }
+            ggml_tensor* guidance = make_optional_input(this->guidance_tensor);
+            std::vector<ggml_tensor*> ref_latents;
+            ref_latents.reserve(ref_latents_tensor.size());
+            for (const auto& ref_latent_tensor : ref_latents_tensor) {
+                ref_latents.push_back(make_input(ref_latent_tensor));
+            }
+
             GGML_ASSERT(x->ne[3] == 1);
             ggml_cgraph* gf = new_graph_custom(FLUX_GRAPH_SIZE);
 
             ggml_tensor* mod_index_arange = nullptr;
             ggml_tensor* dct              = nullptr;  // for chroma radiance
 
-            x       = to_backend(x);
-            context = to_backend(context);
-            if (c_concat != nullptr) {
-                c_concat = to_backend(c_concat);
-            }
             if (flux_params.is_chroma) {
-                guidance = ggml_set_f32(guidance, 0);
-
                 if (!use_mask) {
                     y = nullptr;
                 }
@@ -1385,16 +1407,6 @@ namespace Flux {
                 mod_index_arange     = ggml_new_tensor_1d(compute_ctx, GGML_TYPE_F32, mod_index_arange_vec.size());
                 set_backend_tensor_data(mod_index_arange, mod_index_arange_vec.data());
             }
-            y = to_backend(y);
-
-            timesteps = to_backend(timesteps);
-            if (flux_params.guidance_embed || flux_params.is_chroma) {
-                guidance = to_backend(guidance);
-            }
-            for (int i = 0; i < ref_latents.size(); i++) {
-                ref_latents[i] = to_backend(ref_latents[i]);
-            }
-
             std::set<int> txt_arange_dims;
             if (sd_version_is_flux2(version)) {
                 txt_arange_dims    = {3};
@@ -1402,7 +1414,6 @@ namespace Flux {
             } else if (version == VERSION_OVIS_IMAGE) {
                 txt_arange_dims = {1, 2};
             }
-
             pe_vec      = Rope::gen_flux_pe(static_cast<int>(x->ne[1]),
                                             static_cast<int>(x->ne[0]),
                                             flux_params.patch_size,
@@ -1415,7 +1426,8 @@ namespace Flux {
                                             flux_params.theta,
                                             circular_y_enabled,
                                             circular_x_enabled,
-                                            flux_params.axes_dim);
+                                            flux_params.axes_dim,
+                                            sd_version_is_longcat(version));
             int pos_len = static_cast<int>(pe_vec.size() / flux_params.axes_dim_sum / 2);
             // LOG_DEBUG("pos_len %d", pos_len);
             auto pe = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, flux_params.axes_dim_sum / 2, pos_len);
@@ -1455,18 +1467,16 @@ namespace Flux {
             return gf;
         }
 
-        bool compute(int n_threads,
-                     ggml_tensor* x,
-                     ggml_tensor* timesteps,
-                     ggml_tensor* context,
-                     ggml_tensor* c_concat,
-                     ggml_tensor* y,
-                     ggml_tensor* guidance,
-                     std::vector<ggml_tensor*> ref_latents = {},
-                     bool increase_ref_index               = false,
-                     ggml_tensor** output                  = nullptr,
-                     ggml_context* output_ctx              = nullptr,
-                     std::vector<int> skip_layers          = std::vector<int>()) {
+        sd::Tensor<float> compute(int n_threads,
+                                  const sd::Tensor<float>& x,
+                                  const sd::Tensor<float>& timesteps,
+                                  const sd::Tensor<float>& context                  = {},
+                                  const sd::Tensor<float>& c_concat                 = {},
+                                  const sd::Tensor<float>& y                        = {},
+                                  const sd::Tensor<float>& guidance                 = {},
+                                  const std::vector<sd::Tensor<float>>& ref_latents = {},
+                                  bool increase_ref_index                           = false,
+                                  std::vector<int> skip_layers                      = std::vector<int>()) {
             // x: [N, in_channels, h, w]
             // timesteps: [N, ]
             // context: [N, max_position, hidden_size]
@@ -1476,7 +1486,8 @@ namespace Flux {
                 return build_graph(x, timesteps, context, c_concat, y, guidance, ref_latents, increase_ref_index, skip_layers);
             };
 
-            return GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx);
+            auto result = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false), x.dim());
+            return result;
         }
 
         void test() {
@@ -1485,41 +1496,51 @@ namespace Flux {
             params.mem_buffer = nullptr;
             params.no_alloc   = false;
 
-            ggml_context* work_ctx = ggml_init(params);
-            GGML_ASSERT(work_ctx != nullptr);
+            ggml_context* ctx = ggml_init(params);
+            GGML_ASSERT(ctx != nullptr);
 
             {
                 // cpu f16:
                 // cuda f16: nan
                 // cuda q8_0: pass
-                auto x = ggml_new_tensor_4d(work_ctx, GGML_TYPE_F32, 16, 16, 128, 1);
+                sd::Tensor<float> x({16, 16, 128, 1});
                 // ggml_set_f32(x, 0.01f);
-                // auto x = load_tensor_from_file(work_ctx, "chroma_x.bin");
+                // auto x = load_tensor_from_file(ctx, "chroma_x.bin");
                 // print_ggml_tensor(x);
 
                 std::vector<float> timesteps_vec(1, 1.f);
-                auto timesteps = vector_to_ggml_tensor(work_ctx, timesteps_vec);
+                auto timesteps = sd::Tensor<float>::from_vector(timesteps_vec);
 
                 std::vector<float> guidance_vec(1, 0.f);
-                auto guidance = vector_to_ggml_tensor(work_ctx, guidance_vec);
+                auto guidance = sd::Tensor<float>::from_vector(guidance_vec);
 
-                auto context = ggml_new_tensor_3d(work_ctx, GGML_TYPE_F32, 15360, 256, 1);
+                sd::Tensor<float> context({15360, 256, 1});
                 // ggml_set_f32(context, 0.01f);
-                // auto context = load_tensor_from_file(work_ctx, "chroma_context.bin");
+                // auto context = load_tensor_from_file(ctx, "chroma_context.bin");
                 // print_ggml_tensor(context);
 
-                // auto y = ggml_new_tensor_2d(work_ctx, GGML_TYPE_F32, 768, 1);
+                // auto y = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 768, 1);
                 // ggml_set_f32(y, 0.01f);
                 auto y = nullptr;
                 // print_ggml_tensor(y);
 
-                ggml_tensor* out = nullptr;
+                sd::Tensor<float> out;
 
-                int64_t t0 = ggml_time_ms();
-                compute(8, x, timesteps, context, nullptr, y, guidance, {}, false, &out, work_ctx);
-                int64_t t1 = ggml_time_ms();
+                int64_t t0   = ggml_time_ms();
+                auto out_opt = compute(8,
+                                       x,
+                                       timesteps,
+                                       context,
+                                       {},
+                                       {},
+                                       guidance,
+                                       {},
+                                       false);
+                int64_t t1   = ggml_time_ms();
 
-                print_ggml_tensor(out);
+                GGML_ASSERT(!out_opt.empty());
+                out = std::move(out_opt);
+                print_sd_tensor(out);
                 LOG_DEBUG("flux test done in %lldms", t1 - t0);
             }
         }
@@ -1545,7 +1566,7 @@ namespace Flux {
             }
 
             std::shared_ptr<FluxRunner> flux = std::make_shared<FluxRunner>(backend,
-                                                                            false,
+                                                                            backend,
                                                                             tensor_storage_map,
                                                                             "model.diffusion_model",
                                                                             VERSION_FLUX2,

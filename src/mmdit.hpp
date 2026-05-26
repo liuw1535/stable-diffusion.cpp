@@ -767,6 +767,8 @@ public:
             auto context_x = block->forward(ctx, context, x, c_mod);
             context        = context_x.first;
             x              = context_x.second;
+            sd::ggml_graph_cut::mark_graph_cut(context, "mmdit.joint_blocks." + std::to_string(i), "context");
+            sd::ggml_graph_cut::mark_graph_cut(x, "mmdit.joint_blocks." + std::to_string(i), "x");
         }
 
         x = final_layer->forward(ctx, x, c_mod);  // (N, T, patch_size ** 2 * out_channels)
@@ -809,6 +811,11 @@ public:
 
             context = context_embedder->forward(ctx, context);  // [N, L, D] aka [N, L, 1536]
         }
+        sd::ggml_graph_cut::mark_graph_cut(x, "mmdit.prelude", "x");
+        sd::ggml_graph_cut::mark_graph_cut(c, "mmdit.prelude", "c");
+        if (context != nullptr) {
+            sd::ggml_graph_cut::mark_graph_cut(context, "mmdit.prelude", "context");
+        }
 
         x = forward_core_with_concat(ctx, x, c, context, skip_layers);  // (N, H*W, patch_size ** 2 * out_channels)
 
@@ -821,10 +828,10 @@ struct MMDiTRunner : public GGMLRunner {
     MMDiT mmdit;
 
     MMDiTRunner(ggml_backend_t backend,
-                bool offload_params_to_cpu,
+                ggml_backend_t params_backend,
                 const String2TensorStorage& tensor_storage_map = {},
                 const std::string prefix                       = "")
-        : GGMLRunner(backend, offload_params_to_cpu), mmdit(tensor_storage_map) {
+        : GGMLRunner(backend, params_backend), mmdit(tensor_storage_map) {
         mmdit.init(params_ctx, tensor_storage_map, prefix);
     }
 
@@ -836,17 +843,17 @@ struct MMDiTRunner : public GGMLRunner {
         mmdit.get_param_tensors(tensors, prefix);
     }
 
-    ggml_cgraph* build_graph(ggml_tensor* x,
-                             ggml_tensor* timesteps,
-                             ggml_tensor* context,
-                             ggml_tensor* y,
-                             std::vector<int> skip_layers = std::vector<int>()) {
+    ggml_cgraph* build_graph(const sd::Tensor<float>& x_tensor,
+                             const sd::Tensor<float>& timesteps_tensor,
+                             const sd::Tensor<float>& context_tensor = {},
+                             const sd::Tensor<float>& y_tensor       = {},
+                             std::vector<int> skip_layers            = std::vector<int>()) {
         ggml_cgraph* gf = new_graph_custom(MMDIT_GRAPH_SIZE);
 
-        x         = to_backend(x);
-        context   = to_backend(context);
-        y         = to_backend(y);
-        timesteps = to_backend(timesteps);
+        ggml_tensor* x         = make_input(x_tensor);
+        ggml_tensor* timesteps = make_input(timesteps_tensor);
+        ggml_tensor* context   = make_optional_input(context_tensor);
+        ggml_tensor* y         = make_optional_input(y_tensor);
 
         auto runner_ctx  = get_context();
         ggml_tensor* out = mmdit.forward(&runner_ctx,
@@ -861,14 +868,12 @@ struct MMDiTRunner : public GGMLRunner {
         return gf;
     }
 
-    bool compute(int n_threads,
-                 ggml_tensor* x,
-                 ggml_tensor* timesteps,
-                 ggml_tensor* context,
-                 ggml_tensor* y,
-                 ggml_tensor** output         = nullptr,
-                 ggml_context* output_ctx     = nullptr,
-                 std::vector<int> skip_layers = std::vector<int>()) {
+    sd::Tensor<float> compute(int n_threads,
+                              const sd::Tensor<float>& x,
+                              const sd::Tensor<float>& timesteps,
+                              const sd::Tensor<float>& context = {},
+                              const sd::Tensor<float>& y       = {},
+                              std::vector<int> skip_layers     = std::vector<int>()) {
         // x: [N, in_channels, h, w]
         // timesteps: [N, ]
         // context: [N, max_position, hidden_size]([N, 154, 4096]) or [1, max_position, hidden_size]
@@ -877,7 +882,7 @@ struct MMDiTRunner : public GGMLRunner {
             return build_graph(x, timesteps, context, y, skip_layers);
         };
 
-        return GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx);
+        return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false), x.dim());
     }
 
     void test() {
@@ -886,35 +891,41 @@ struct MMDiTRunner : public GGMLRunner {
         params.mem_buffer = nullptr;
         params.no_alloc   = false;
 
-        ggml_context* work_ctx = ggml_init(params);
-        GGML_ASSERT(work_ctx != nullptr);
+        ggml_context* ctx = ggml_init(params);
+        GGML_ASSERT(ctx != nullptr);
 
         {
             // cpu f16: pass
             // cpu f32: pass
             // cuda f16: pass
             // cuda f32: pass
-            auto x = ggml_new_tensor_4d(work_ctx, GGML_TYPE_F32, 128, 128, 16, 1);
+            sd::Tensor<float> x({128, 128, 16, 1});
             std::vector<float> timesteps_vec(1, 999.f);
-            auto timesteps = vector_to_ggml_tensor(work_ctx, timesteps_vec);
-            ggml_set_f32(x, 0.01f);
+            auto timesteps = sd::Tensor<float>::from_vector(timesteps_vec);
+            x.fill_(0.01f);
             // print_ggml_tensor(x);
 
-            auto context = ggml_new_tensor_3d(work_ctx, GGML_TYPE_F32, 4096, 154, 1);
-            ggml_set_f32(context, 0.01f);
+            sd::Tensor<float> context({4096, 154, 1});
+            context.fill_(0.01f);
             // print_ggml_tensor(context);
 
-            auto y = ggml_new_tensor_2d(work_ctx, GGML_TYPE_F32, 2048, 1);
-            ggml_set_f32(y, 0.01f);
+            sd::Tensor<float> y({2048, 1});
+            y.fill_(0.01f);
             // print_ggml_tensor(y);
 
-            ggml_tensor* out = nullptr;
+            sd::Tensor<float> out;
 
-            int64_t t0 = ggml_time_ms();
-            compute(8, x, timesteps, context, y, &out, work_ctx);
-            int64_t t1 = ggml_time_ms();
+            int64_t t0   = ggml_time_ms();
+            auto out_opt = compute(8,
+                                   x,
+                                   timesteps,
+                                   context,
+                                   y);
+            int64_t t1   = ggml_time_ms();
 
-            print_ggml_tensor(out);
+            GGML_ASSERT(!out_opt.empty());
+            out = std::move(out_opt);
+            print_sd_tensor(out);
             LOG_DEBUG("mmdit test done in %lldms", t1 - t0);
         }
     }
@@ -923,7 +934,7 @@ struct MMDiTRunner : public GGMLRunner {
         // ggml_backend_t backend    = ggml_backend_cuda_init(0);
         ggml_backend_t backend             = ggml_backend_cpu_init();
         ggml_type model_data_type          = GGML_TYPE_F16;
-        std::shared_ptr<MMDiTRunner> mmdit = std::make_shared<MMDiTRunner>(backend, false);
+        std::shared_ptr<MMDiTRunner> mmdit = std::make_shared<MMDiTRunner>(backend, backend);
         {
             LOG_INFO("loading from '%s'", file_path.c_str());
 

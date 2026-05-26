@@ -411,13 +411,13 @@ public:
 
 public:
     PhotoMakerIDEncoder(ggml_backend_t backend,
-                        bool offload_params_to_cpu,
+                        ggml_backend_t params_backend,
                         const String2TensorStorage& tensor_storage_map,
                         const std::string prefix,
                         SDVersion version = VERSION_SDXL,
                         PMVersion pm_v    = PM_VERSION_1,
                         float sty         = 20.f)
-        : GGMLRunner(backend, offload_params_to_cpu),
+        : GGMLRunner(backend, params_backend),
           version(version),
           pm_version(pm_v),
           style_strength(sty) {
@@ -443,11 +443,10 @@ public:
             id_encoder2.get_param_tensors(tensors, prefix);
     }
 
-    ggml_cgraph* build_graph(  // ggml_allocr* allocr,
-        ggml_tensor* id_pixel_values,
-        ggml_tensor* prompt_embeds,
-        std::vector<bool>& class_tokens_mask,
-        ggml_tensor* id_embeds) {
+    ggml_cgraph* build_graph(const sd::Tensor<float>& id_pixel_values_tensor,
+                             const sd::Tensor<float>& prompt_embeds_tensor,
+                             std::vector<bool>& class_tokens_mask,
+                             const sd::Tensor<float>& id_embeds_tensor = {}) {
         ctm.clear();
         ctmf16.clear();
         ctmpos.clear();
@@ -460,15 +459,15 @@ public:
 
         ggml_cgraph* gf = ggml_new_graph(compute_ctx);
 
+        ggml_tensor* id_pixel_values = make_input(id_pixel_values_tensor);
+        ggml_tensor* prompt_embeds   = make_input(prompt_embeds_tensor);
+        ggml_tensor* id_embeds       = make_optional_input(id_embeds_tensor);
+
         int64_t hidden_size = prompt_embeds->ne[0];
         int64_t seq_length  = prompt_embeds->ne[1];
         ggml_type type      = GGML_TYPE_F32;
 
         ggml_tensor* class_tokens_mask_d = ggml_new_tensor_1d(runner_ctx.ggml_ctx, type, class_tokens_mask.size());
-
-        ggml_tensor* id_pixel_values_d = to_backend(id_pixel_values);
-        ggml_tensor* prompt_embeds_d   = to_backend(prompt_embeds);
-        ggml_tensor* id_embeds_d       = to_backend(id_embeds);
 
         ggml_tensor* left  = nullptr;
         ggml_tensor* right = nullptr;
@@ -529,18 +528,18 @@ public:
         ggml_tensor* updated_prompt_embeds = nullptr;
         if (pm_version == PM_VERSION_1)
             updated_prompt_embeds = id_encoder.forward(&runner_ctx,
-                                                       id_pixel_values_d,
-                                                       prompt_embeds_d,
+                                                       id_pixel_values,
+                                                       prompt_embeds,
                                                        class_tokens_mask_d,
                                                        class_tokens_mask_pos,
                                                        left, right);
         else if (pm_version == PM_VERSION_2)
             updated_prompt_embeds = id_encoder2.forward(&runner_ctx,
-                                                        id_pixel_values_d,
-                                                        prompt_embeds_d,
+                                                        id_pixel_values,
+                                                        prompt_embeds,
                                                         class_tokens_mask_d,
                                                         class_tokens_mask_pos,
-                                                        id_embeds_d,
+                                                        id_embeds,
                                                         left, right);
 
         ggml_build_forward_expand(gf, updated_prompt_embeds);
@@ -548,20 +547,16 @@ public:
         return gf;
     }
 
-    bool compute(const int n_threads,
-                 ggml_tensor* id_pixel_values,
-                 ggml_tensor* prompt_embeds,
-                 ggml_tensor* id_embeds,
-                 std::vector<bool>& class_tokens_mask,
-                 ggml_tensor** updated_prompt_embeds,
-                 ggml_context* output_ctx) {
+    sd::Tensor<float> compute(const int n_threads,
+                              const sd::Tensor<float>& id_pixel_values,
+                              const sd::Tensor<float>& prompt_embeds,
+                              const sd::Tensor<float>& id_embeds,
+                              std::vector<bool>& class_tokens_mask) {
         auto get_graph = [&]() -> ggml_cgraph* {
-            // return build_graph(compute_allocr, id_pixel_values, prompt_embeds, class_tokens_mask);
             return build_graph(id_pixel_values, prompt_embeds, class_tokens_mask, id_embeds);
         };
 
-        // GGMLRunner::compute(get_graph, n_threads, updated_prompt_embeds);
-        return GGMLRunner::compute(get_graph, n_threads, true, updated_prompt_embeds, output_ctx);
+        return take_or_empty(GGMLRunner::compute<float>(get_graph, n_threads, true));
     }
 };
 
@@ -573,11 +568,11 @@ struct PhotoMakerIDEmbed : public GGMLRunner {
     bool applied     = false;
 
     PhotoMakerIDEmbed(ggml_backend_t backend,
-                      bool offload_params_to_cpu,
+                      ggml_backend_t params_backend,
                       ModelLoader* ml,
                       const std::string& file_path = "",
                       const std::string& prefix    = "")
-        : file_path(file_path), GGMLRunner(backend, offload_params_to_cpu), model_loader(ml) {
+        : file_path(file_path), GGMLRunner(backend, params_backend), model_loader(ml) {
         if (!model_loader->init_from_file_and_convert_name(file_path, prefix)) {
             load_failed = true;
         }
