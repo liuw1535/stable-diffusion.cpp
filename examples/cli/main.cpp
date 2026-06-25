@@ -85,6 +85,7 @@ struct SDCliParams {
             {"",
              "--encrypt",
              "password to encrypt output images (leave empty for no encryption)",
+             0,
              &encrypt_password},
         };
 
