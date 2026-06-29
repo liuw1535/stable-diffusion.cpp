@@ -386,39 +386,6 @@ static bool write_binary_file(const fs::path& path, const std::vector<uint8_t>& 
     return true;
 }
 
-static bool encrypt_file_in_place(const fs::path& path, const std::string& password) {
-    if (password.empty()) {
-        return true;
-    }
-
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    if (!file) {
-        LOG_ERROR("failed to open file '%s' for encryption", path.string().c_str());
-        return false;
-    }
-
-    const std::streampos end_pos = file.tellg();
-    if (end_pos < 0) {
-        LOG_ERROR("failed to read file size for encryption: '%s'", path.string().c_str());
-        return false;
-    }
-
-    std::vector<uint8_t> buffer(static_cast<size_t>(end_pos));
-    file.seekg(0);
-    if (!buffer.empty()) {
-        const std::streamsize bytes_to_read = static_cast<std::streamsize>(buffer.size());
-        file.read(reinterpret_cast<char*>(buffer.data()), bytes_to_read);
-        if (file.gcount() != bytes_to_read) {
-            LOG_ERROR("failed to read file '%s' for encryption", path.string().c_str());
-            return false;
-        }
-    }
-    file.close();
-
-    encrypt_buffer(buffer, password);
-    return write_binary_file(path, buffer);
-}
-
 static bool write_preview_image_to_file(const SDCliParams& cli_params, const sd_image_t& image) {
     if (image.data == nullptr || image.width == 0 || image.height == 0 || image.channel == 0) {
         return false;
@@ -561,10 +528,23 @@ bool save_results(const SDCliParams& cli_params,
         std::string params          = gen_params.embed_image_metadata
                                           ? get_image_params(ctx_params, gen_params, metadata_seed, cli_params.mode)
                                           : "";
-        bool ok                     = write_image_to_file(path.string(), img.data, img.width, img.height, img.channel, params, 90);
 
-        if (ok) {
-            ok = encrypt_file_in_place(path, cli_params.encrypt_password);
+        bool ok = false;
+        if (!cli_params.encrypt_password.empty()) {
+            const EncodedImageFormat format = encoded_image_format_from_path(path.string());
+            std::vector<uint8_t> buffer    = encode_image_to_vector(format,
+                                                                     img.data,
+                                                                     static_cast<int>(img.width),
+                                                                     static_cast<int>(img.height),
+                                                                     static_cast<int>(img.channel),
+                                                                     params,
+                                                                     90);
+            if (!buffer.empty()) {
+                encrypt_buffer(buffer, cli_params.encrypt_password);
+                ok = write_binary_file(path, buffer);
+            }
+        } else {
+            ok = write_image_to_file(path.string(), img.data, img.width, img.height, img.channel, params, 90);
         }
 
         LOG_INFO("save result image %d to '%s' (%s%s)",
