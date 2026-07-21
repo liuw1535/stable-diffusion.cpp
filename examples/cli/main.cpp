@@ -91,7 +91,8 @@ struct SDCliParams {
              "password to encrypt output images (leave empty for no encryption)",
              0,
              &encrypt_password},
-=======
+	    {
+	     "",
              "--imat-out",
              "compute the imatrix for this run and save it to the provided path",
              0,
