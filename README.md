@@ -48,14 +48,16 @@ API and command-line option may change frequently.***
     - [PiD](./docs/pid.md)
     - [LongCat Image](./docs/longcat_image.md)
     - [Z-Image](./docs/z_image.md)
+    - [MiniT2I](./docs/minit2i.md)
     - [Ovis-Image](./docs/ovis_image.md)
     - [Anima](./docs/anima.md)
     - [ERNIE-Image](./docs/ernie_image.md)
     - [Boogu Image](./docs/boogu_image.md)
     - [Krea2](./docs/krea2.md)
+    - [SeFi-Image](./docs/sefi_image.md)
     - [HiDream-O1-Image](./docs/hidream_o1_image.md)
     - [Ideogram4](./docs/ideogram4.md)
-  - Image Edit Models
+  - [Image Edit Models](./docs/edit.md)
     - [FLUX.1-Kontext-dev](./docs/kontext.md)
     - [Qwen Image Edit series](./docs/qwen_image_edit.md)
     - [LongCat Image Edit](./docs/longcat_image.md)
@@ -63,8 +65,11 @@ API and command-line option may change frequently.***
   - Video Models
     - [Wan2.1/Wan2.2](./docs/wan.md)
     - [LTX-2.3](./docs/ltx2.md)
+    - [HunyuanVideo 1.5](./docs/hunyuan_video.md)
+    - [LingBot-Video](./docs/lingbot_video.md)
   - [PhotoMaker](./docs/photo_maker.md) support.
   - Control Net support with SD 1.5
+  - [ADetailer](./docs/adetailer.md)
   - LoRA support, same as [stable-diffusion-webui](https://github.com/AUTOMATIC1111/stable-diffusion-webui/wiki/Features#lora)
   - Latent Consistency Models support (LCM/LCM-LoRA)
   - Faster and memory efficient latent decoding with [TAESD](./docs/taesd.md)
@@ -174,23 +179,3 @@ These projects use `stable-diffusion.cpp` as a backend for their image generatio
 Thank you to all the people who have already contributed to stable-diffusion.cpp!
 
 [![Contributors](https://contrib.rocks/image?repo=leejet/stable-diffusion.cpp)](https://github.com/leejet/stable-diffusion.cpp/graphs/contributors)
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=leejet/stable-diffusion.cpp&type=Date)](https://star-history.com/#leejet/stable-diffusion.cpp&Date)
-
-## References
-
-- [ggml](https://github.com/ggml-org/ggml)
-- [diffusers](https://github.com/huggingface/diffusers)
-- [stable-diffusion](https://github.com/CompVis/stable-diffusion)
-- [sd3-ref](https://github.com/Stability-AI/sd3-ref)
-- [stable-diffusion-stability-ai](https://github.com/Stability-AI/stablediffusion)
-- [stable-diffusion-webui](https://github.com/AUTOMATIC1111/stable-diffusion-webui)
-- [ComfyUI](https://github.com/comfyanonymous/ComfyUI)
-- [k-diffusion](https://github.com/crowsonkb/k-diffusion)
-- [latent-consistency-model](https://github.com/luosiallen/latent-consistency-model)
-- [generative-models](https://github.com/Stability-AI/generative-models/)
-- [PhotoMaker](https://github.com/TencentARC/PhotoMaker)
-- [Wan2.1](https://github.com/Wan-Video/Wan2.1)
-- [Wan2.2](https://github.com/Wan-Video/Wan2.2)
