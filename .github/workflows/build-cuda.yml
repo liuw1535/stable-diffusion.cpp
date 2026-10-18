@@ -27,12 +27,9 @@ jobs:
           wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update
-          sudo apt-get install -y \
-            cuda-compiler-12-8 \
-            cuda-libraries-dev-12-8 \
-            cuda-nvrtc-12-8 \
-            libcudart-12-8 \
-            libcudart-dev-12-8
+          # cuda-toolkit-12-8 pulls in nvcc, cudart (runtime + dev), nvrtc,
+          # and the rest of the toolkit without the display driver.
+          sudo apt-get install -y cuda-toolkit-12-8
           echo "/usr/local/cuda-12.8/bin" >> "$GITHUB_PATH"
           echo "CUDA_PATH=/usr/local/cuda-12.8" >> "$GITHUB_ENV"
           echo "CUDA_HOME=/usr/local/cuda-12.8" >> "$GITHUB_ENV"
