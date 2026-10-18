@@ -1,0 +1,69 @@
+name: Build CUDA (ubuntu-22.04 amd64)
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-cuda:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake build-essential
+
+      - name: Setup CUDA 12.8
+        run: |
+          # Use the NVIDIA-provided CUDA 12.8 apt repository so the build
+          # does not depend on a pre-installed toolkit on the runner.
+          wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y \
+            cuda-compiler-12-8 \
+            cuda-libraries-dev-12-8 \
+            cuda-nvrtc-12-8 \
+            libcudart-12-8 \
+            libcudart-dev-12-8
+          echo "/usr/local/cuda-12.8/bin" >> "$GITHUB_PATH"
+          echo "CUDA_PATH=/usr/local/cuda-12.8" >> "$GITHUB_ENV"
+          echo "CUDA_HOME=/usr/local/cuda-12.8" >> "$GITHUB_ENV"
+
+      - name: Verify CUDA
+        run: |
+          nvcc --version
+          nvidia-smi || true
+
+      - name: Configure (CMake + Ninja, CUDA backend)
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSD_CUDA=ON \
+            -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc \
+            # Target the NVIDIA T4 (Turing, compute capability 7.5) used on
+            # Kaggle. 75-real emits a real cubin instead of PTX-only.
+            -DCMAKE_CUDA_ARCHITECTURES=75-real
+
+      - name: Build
+        run: |
+          cmake --build build --target sd-cli sd-server -j"$(nproc)"
+
+      - name: Package artifacts
+        run: |
+          # Flat tarball: only the two binaries, no enclosing directory.
+          tar -czvf sdcpp.tar.gz -C build/bin sd-cli sd-server
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdcpp-cuda-ubuntu2204-amd64
+          path: sdcpp.tar.gz
+          if-no-files-found: error
