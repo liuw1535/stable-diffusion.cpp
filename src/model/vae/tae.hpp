@@ -1,8 +1,12 @@
 #ifndef __SD_MODEL_VAE_TAE_HPP__
 #define __SD_MODEL_VAE_TAE_HPP__
 
-#include "core/ggml_extend.hpp"
+#include "core/ggml_extend.h"
+#include "core/ggml_runner.h"
+#include "core/rng.hpp"
+#include "core/util.h"
 #include "model.h"
+#include "model/common/ggml_block.hpp"
 
 /*
     ===================================    TinyAutoEncoder  ===================================
@@ -65,7 +69,7 @@ public:
 
         if (n_in != n_out) {
             auto skip = std::dynamic_pointer_cast<Conv2d>(blocks["skip"]);
-            LOG_DEBUG("skip");
+            LOG_VERBOSE("skip");
             x = skip->forward(ctx, x);
         }
 
@@ -80,12 +84,17 @@ class TinyEncoder : public UnaryBlock {
     int channels    = 64;
     int z_channels  = 4;
     int num_blocks  = 3;
+    bool f16;
 
 public:
-    TinyEncoder(int z_channels = 4, bool use_midblock_gn = false)
-        : z_channels(z_channels) {
-        int index                       = 0;
+    TinyEncoder(int z_channels = 4, bool use_midblock_gn = false, bool f16 = false)
+        : z_channels(z_channels), f16(f16) {
+        in_channels                     = f16 ? 16 : 3;
+        int index                       = f16 ? 1 : 0;
         blocks[std::to_string(index++)] = std::shared_ptr<GGMLBlock>(new Conv2d(in_channels, channels, {3, 3}, {1, 1}, {1, 1}));
+        if (f16) {
+            index++;  // nn.ReLU()
+        }
         blocks[std::to_string(index++)] = std::shared_ptr<GGMLBlock>(new TAEBlock(channels, channels));
 
         blocks[std::to_string(index++)] = std::shared_ptr<GGMLBlock>(new Conv2d(channels, channels, {3, 3}, {2, 2}, {1, 1}, {1, 1}, false));
@@ -93,12 +102,14 @@ public:
             blocks[std::to_string(index++)] = std::shared_ptr<GGMLBlock>(new TAEBlock(channels, channels));
         }
 
-        blocks[std::to_string(index++)] = std::shared_ptr<GGMLBlock>(new Conv2d(channels, channels, {3, 3}, {2, 2}, {1, 1}, {1, 1}, false));
+        blocks[std::to_string(index++)] = std::shared_ptr<GGMLBlock>(new Conv2d(channels, f16 ? channels * 2 : channels, {3, 3}, {2, 2}, {1, 1}, {1, 1}, false));
+        channels *= f16 ? 2 : 1;
         for (int i = 0; i < num_blocks; i++) {
             blocks[std::to_string(index++)] = std::shared_ptr<GGMLBlock>(new TAEBlock(channels, channels));
         }
 
-        blocks[std::to_string(index++)] = std::shared_ptr<GGMLBlock>(new Conv2d(channels, channels, {3, 3}, {2, 2}, {1, 1}, {1, 1}, false));
+        blocks[std::to_string(index++)] = std::shared_ptr<GGMLBlock>(new Conv2d(channels, f16 ? channels * 2 : channels, {3, 3}, {2, 2}, {1, 1}, {1, 1}, false));
+        channels *= f16 ? 2 : 1;
         for (int i = 0; i < num_blocks; i++) {
             blocks[std::to_string(index++)] = std::shared_ptr<GGMLBlock>(new TAEBlock(channels, channels, use_midblock_gn));
         }
@@ -110,7 +121,11 @@ public:
         // x: [n, in_channels, h, w]
         // return: [n, z_channels, h/8, w/8]
 
-        for (int i = 0; i < num_blocks * 3 + 6; i++) {
+        for (int i = f16 ? 1 : 0; i < num_blocks * 3 + 6 + (f16 ? 2 : 0); i++) {
+            if (f16 && i == 2) {
+                x = ggml_relu_inplace(ctx->ggml_ctx, x);
+                continue;
+            }
             auto block = std::dynamic_pointer_cast<UnaryBlock>(blocks[std::to_string(i)]);
 
             x = block->forward(ctx, x);
@@ -127,9 +142,11 @@ class TinyDecoder : public UnaryBlock {
     int num_blocks   = 3;
 
 public:
-    TinyDecoder(int z_channels = 4, bool use_midblock_gn = false)
+    TinyDecoder(int z_channels = 4, bool use_midblock_gn = false, bool f16 = false)
         : z_channels(z_channels) {
-        int index = 0;
+        channels     = f16 ? 256 : 64;
+        out_channels = f16 ? 16 : 3;
+        int index    = 0;
 
         blocks[std::to_string(index++)] = std::shared_ptr<GGMLBlock>(new Conv2d(z_channels, channels, {3, 3}, {1, 1}, {1, 1}));
         index++;  // nn.ReLU()
@@ -138,13 +155,15 @@ public:
             blocks[std::to_string(index++)] = std::shared_ptr<GGMLBlock>(new TAEBlock(channels, channels, use_midblock_gn));
         }
         index++;  // nn.Upsample()
-        blocks[std::to_string(index++)] = std::shared_ptr<GGMLBlock>(new Conv2d(channels, channels, {3, 3}, {1, 1}, {1, 1}, {1, 1}, false));
+        blocks[std::to_string(index++)] = std::shared_ptr<GGMLBlock>(new Conv2d(channels, f16 ? channels / 2 : channels, {3, 3}, {1, 1}, {1, 1}, {1, 1}, false));
+        channels /= f16 ? 2 : 1;
 
         for (int i = 0; i < num_blocks; i++) {
             blocks[std::to_string(index++)] = std::shared_ptr<GGMLBlock>(new TAEBlock(channels, channels));
         }
         index++;  // nn.Upsample()
-        blocks[std::to_string(index++)] = std::shared_ptr<GGMLBlock>(new Conv2d(channels, channels, {3, 3}, {1, 1}, {1, 1}, {1, 1}, false));
+        blocks[std::to_string(index++)] = std::shared_ptr<GGMLBlock>(new Conv2d(channels, f16 ? channels / 2 : channels, {3, 3}, {1, 1}, {1, 1}, {1, 1}, false));
+        channels /= f16 ? 2 : 1;
 
         for (int i = 0; i < num_blocks; i++) {
             blocks[std::to_string(index++)] = std::shared_ptr<GGMLBlock>(new TAEBlock(channels, channels));
@@ -426,10 +445,10 @@ class TinyVideoDecoder : public UnaryBlock {
     static const int num_layers  = 3;
     int channels[num_layers + 1] = {256, 128, 64, 64};
     int patch_size               = 1;
-    int t_upscale                = 1;
     bool is_wide                 = false;
 
 public:
+    int t_upscale = 1;
     TinyVideoDecoder(int z_channels = 4, int patch_size = 1, std::vector<bool> time_upscale = {false, true, true}, bool is_wide = false)
         : z_channels(z_channels), patch_size(patch_size), is_wide(is_wide) {
         t_upscale = 1;
@@ -536,6 +555,10 @@ public:
             patch          = 4;
             time_downscale = {true, true, true};
             time_upscale   = {true, true, true};
+        } else if (sd_version_is_minimax_h3(version)) {
+            z_channels     = 24;
+            patch          = 2;
+            time_downscale = {true, true, false};
         }
         blocks["decoder"] = std::shared_ptr<GGMLBlock>(new TinyVideoDecoder(z_channels, patch, time_upscale, is_wide));
         if (!decode_only) {
@@ -545,24 +568,123 @@ public:
 
     ggml_tensor* decode(GGMLRunnerContext* ctx, ggml_tensor* z) {
         auto decoder = std::dynamic_pointer_cast<TinyVideoDecoder>(blocks["decoder"]);
-        if (sd_version_is_wan(version) || sd_version_is_hunyuan_video(version) || sd_version_is_ltxav(version)) {
+        if (sd_version_is_wan(version) || sd_version_is_hunyuan_video(version) || sd_version_is_ltxav(version) || sd_version_is_minimax_h3(version)) {
             // (W, H, C, T) -> (W, H, T, C)
             z = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, z, 0, 1, 3, 2));
         }
         auto result = decoder->forward(ctx, z);
-        if (sd_version_is_wan(version) || sd_version_is_hunyuan_video(version) || sd_version_is_ltxav(version)) {
+
+        if (sd_version_is_minimax_h3(version)) {
+            int64_t num_frames   = result->ne[3];
+            int64_t chunk_frames = 5 * decoder->t_upscale;
+            int64_t pad          = (chunk_frames - (num_frames % chunk_frames)) % chunk_frames;
+
+            result = ggml_ext_pad_ext(ctx->ggml_ctx, ctx->backend, result, 0, 0, 0, 0, 0, 0, 0, static_cast<int>(pad), false, false);
+
+            int64_t num_chunks                  = (num_frames + pad) / chunk_frames;
+            auto to_trim                        = decoder->t_upscale - 1;
+            std::vector<ggml_tensor*> to_concat = {};
+            for (int i = 0; i < num_chunks; i++) {
+                auto chunk = ggml_view_4d(ctx->ggml_ctx, result,
+                                          result->ne[0], result->ne[1], result->ne[2], chunk_frames - to_trim,
+                                          result->nb[1], result->nb[2], result->nb[3],
+                                          i * chunk_frames * result->nb[3]);
+                to_concat.push_back(chunk);
+            }
+            result = ggml_ext_vec_concat(ctx->ggml_ctx, to_concat, 3);
+            result = ggml_view_4d(ctx->ggml_ctx, result,
+                                  result->ne[0], result->ne[1], result->ne[2],
+                                  result->ne[3] - decoder->t_upscale * 3,
+                                  result->nb[1], result->nb[2], result->nb[3], 0);
+        }
+
+        if (sd_version_is_wan(version) || sd_version_is_hunyuan_video(version) || sd_version_is_ltxav(version) || sd_version_is_minimax_h3(version)) {
             // (W, H, T, C) -> (W, H, C, T)
             result = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, result, 0, 1, 3, 2));
         }
         return result;
     }
 
-    ggml_tensor* encode(GGMLRunnerContext* ctx, ggml_tensor* x) {
+    ggml_tensor* encode_h3(GGMLRunnerContext* ctx, ggml_tensor* x) {
         auto encoder = std::dynamic_pointer_cast<TinyVideoEncoder>(blocks["encoder"]);
-        if (sd_version_is_wan(version) || sd_version_is_hunyuan_video(version) || sd_version_is_ltxav(version)) {
+
+        int64_t num_frames = x->ne[3];
+        int64_t pad        = (17 - (num_frames % 17)) % 17;
+
+        if (pad > 0) {
+            auto last_frame = ggml_view_4d(ctx->ggml_ctx, x,
+                                           x->ne[0], x->ne[1], x->ne[2], 1,
+                                           x->nb[1], x->nb[2], x->nb[3],
+                                           (num_frames - 1) * x->nb[3]);
+            for (int i = 0; i < pad; i++) {
+                x = ggml_concat(ctx->ggml_ctx, x, last_frame, 3);
+            }
+        }
+
+        int64_t T_padded   = x->ne[3];
+        int64_t num_chunks = T_padded / 17;
+
+        auto zero_frame = ggml_view_4d(ctx->ggml_ctx, x,
+                                       x->ne[0], x->ne[1], x->ne[2], 1,
+                                       x->nb[1], x->nb[2], x->nb[3], 0);
+        auto zeros_1    = ggml_scale(ctx->ggml_ctx, ggml_cont(ctx->ggml_ctx, zero_frame), 0.0f);
+        auto zeros_3    = zeros_1;
+        for (int i = 1; i < 3; i++) {
+            zeros_3 = ggml_concat(ctx->ggml_ctx, zeros_3, zeros_1, 3);
+        }
+        ggml_tensor* out = nullptr;
+        if (false) {
+            std::vector<ggml_tensor*> to_concat = {};
+            for (int i = 0; i < num_chunks; i++) {
+                auto chunk = ggml_view_4d(ctx->ggml_ctx, x,
+                                          x->ne[0], x->ne[1], x->ne[2], 17,
+                                          x->nb[1], x->nb[2], x->nb[3],
+                                          i * 17 * x->nb[3]);
+
+                auto chunk_padded = ggml_concat(ctx->ggml_ctx, zeros_3, chunk, 3);
+
+                to_concat.push_back(chunk_padded);
+            }
+            ggml_tensor* x_in = ggml_ext_vec_concat(ctx->ggml_ctx, to_concat, 3);
+            out               = encoder->forward(ctx, x_in);
+        } else {
+            std::vector<ggml_tensor*> to_concat = {};
+            for (int i = 0; i < num_chunks; i++) {
+                auto chunk = ggml_view_4d(ctx->ggml_ctx, x,
+                                          x->ne[0], x->ne[1], x->ne[2], 17,
+                                          x->nb[1], x->nb[2], x->nb[3],
+                                          i * 17 * x->nb[3]);
+
+                auto chunk_padded = ggml_concat(ctx->ggml_ctx, zeros_3, chunk, 3);
+
+                auto chunk_out = encoder->forward(ctx, chunk_padded);
+                // auto chunk_out = encoder->forward_seq(ctx, chunk_padded); // ~same vram usage, and straight-up slower. it's already sequential enough
+
+                to_concat.push_back(chunk_out);
+            }
+            out = ggml_ext_vec_concat(ctx->ggml_ctx, to_concat, 3);
+        }
+
+        // Return x[:, :-3] - drop the last 3 elements in the T dimension
+        int64_t out_T = out->ne[3];
+        out           = ggml_view_4d(ctx->ggml_ctx, out,
+                                     out->ne[0], out->ne[1], out->ne[2], out_T - 3,
+                                     out->nb[1], out->nb[2], out->nb[3], 0);
+
+        return ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, out, 0, 1, 3, 2));
+    }
+
+    ggml_tensor* encode(GGMLRunnerContext* ctx, ggml_tensor* x) {
+        if (sd_version_is_wan(version) || sd_version_is_hunyuan_video(version) || sd_version_is_ltxav(version) || (sd_version_is_minimax_h3(version) && x->ne[3] > 1)) {
             // (W, H, T, C) -> (W, H, C, T)
             x = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, x, 0, 1, 3, 2));
         }
+        if (sd_version_is_minimax_h3(version)) {
+            return encode_h3(ctx, x);
+        }
+
+        auto encoder = std::dynamic_pointer_cast<TinyVideoEncoder>(blocks["encoder"]);
+
         int64_t num_frames = x->ne[3];
         if (num_frames % encoder->t_downscale) {
             // pad to multiple of encoder->t_downscale at the end
@@ -584,6 +706,7 @@ class TAESD : public GGMLBlock {
 protected:
     bool decode_only;
     bool taef2 = false;
+    bool f16   = false;
 
 public:
     int z_channels = 4;
@@ -594,17 +717,21 @@ public:
         bool use_midblock_gn = false;
         taef2                = sd_version_uses_flux2_vae(version);
 
-        if (sd_version_is_dit(version)) {
+        if (sd_version_is_dit(version) && !sd_version_is_pixart(version)) {
             z_channels = 16;
         }
         if (taef2) {
             z_channels      = 32;
             use_midblock_gn = true;
         }
-        blocks["decoder.layers"] = std::shared_ptr<GGMLBlock>(new TinyDecoder(z_channels, use_midblock_gn));
+        f16 = version == VERSION_QWEN_IMAGE_2_1;
+        if (f16) {
+            z_channels = 64;
+        }
+        blocks["decoder.layers"] = std::shared_ptr<GGMLBlock>(new TinyDecoder(z_channels, use_midblock_gn, f16));
 
         if (!decode_only) {
-            blocks["encoder.layers"] = std::shared_ptr<GGMLBlock>(new TinyEncoder(z_channels, use_midblock_gn));
+            blocks["encoder.layers"] = std::shared_ptr<GGMLBlock>(new TinyEncoder(z_channels, use_midblock_gn, f16));
         }
     }
 
@@ -613,10 +740,15 @@ public:
         if (taef2) {
             z = unpatchify(ctx->ggml_ctx, z, 2);
         }
-        return decoder->forward(ctx, z);
+        auto x = decoder->forward(ctx, z);
+        return f16 ? unpatchify(ctx->ggml_ctx, x, 2) : x;
     }
 
     ggml_tensor* encode(GGMLRunnerContext* ctx, ggml_tensor* x) {
+        if (f16) {
+            GGML_ASSERT(x->ne[0] % 2 == 0 && x->ne[1] % 2 == 0);
+            x = patchify(ctx->ggml_ctx, x, 2);
+        }
         auto encoder = std::dynamic_pointer_cast<TinyEncoder>(blocks["encoder.layers"]);
         auto z       = encoder->forward(ctx, x);
         if (taef2) {
@@ -684,7 +816,7 @@ struct TinyImageAutoEncoder : public VAE {
             return build_graph(z_tensor, decode_graph);
         };
 
-        return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false), z_tensor.dim());
+        return restore_trailing_singleton_dims(GGMLRunner::compute(get_graph, n_threads, false), z_tensor.dim());
     }
 };
 
@@ -714,6 +846,21 @@ struct TinyVideoAutoEncoder : public VAE {
 
     std::string get_desc() override {
         return "taehv";
+    }
+
+    bool supports_temporal_tiling(VAETemporalDirection direction) const override {
+        return direction == VAETemporalDirection::DECODE && !sd_version_is_minimax_h3(version);
+    }
+
+    int get_temporal_tile_output_scale(VAETemporalDirection direction) const override {
+        SD_UNUSED(direction);
+        int scale = 1;
+        for (bool upscale : taehv.time_upscale) {
+            if (upscale) {
+                scale *= 2;
+            }
+        }
+        return scale;
     }
 
     void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {
@@ -754,7 +901,7 @@ struct TinyVideoAutoEncoder : public VAE {
             return build_graph(z_tensor, decode_graph);
         };
 
-        return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false), z_tensor.dim());
+        return restore_trailing_singleton_dims(GGMLRunner::compute(get_graph, n_threads, false), z_tensor.dim());
     }
 };
 

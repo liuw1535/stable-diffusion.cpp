@@ -44,6 +44,9 @@ static void parse_args(int argc,
         exit(svr_params.normal_exit ? 0 : 1);
     }
 
+    log_level = svr_params.log_level;
+    log_color = svr_params.color;
+
     const bool random_seed_requested = default_gen_params.seed < 0;
 
     if (!svr_params.resolve_and_validate() ||
@@ -62,7 +65,7 @@ static void parse_args(int argc,
 
 void sd_log_cb(enum sd_log_level_t level, const char* log, void* data) {
     SDSvrParams* svr_params = (SDSvrParams*)data;
-    log_print(level, log, svr_params->verbose, svr_params->color);
+    log_print(level, log, svr_params->log_level, svr_params->color);
 }
 
 int main(int argc, const char** argv) {
@@ -72,16 +75,16 @@ int main(int argc, const char** argv) {
     }
     SDSvrParams svr_params;
     SDContextParams ctx_params;
+    // Preserve the CLI default while disabling cwd scans for sd-server.
+    ctx_params.lora_model_dir.clear();
     SDGenerationParams default_gen_params;
-    parse_args(argc, argv, svr_params, ctx_params, default_gen_params);
 
     sd_set_log_callback(sd_log_cb, (void*)&svr_params);
-    log_verbose = svr_params.verbose;
-    log_color   = svr_params.color;
+    parse_args(argc, argv, svr_params, ctx_params, default_gen_params);
 
-    LOG_DEBUG("version: %s", version_string().c_str());
-    LOG_DEBUG("%s", sd_get_system_info());
-    LOG_DEBUG("%s", svr_params.to_string().c_str());
+    LOG_VERBOSE("version: %s", version_string().c_str());
+    LOG_VERBOSE("%s", sd_get_system_info());
+    LOG_VERBOSE("%s", svr_params.to_string().c_str());
     LOG_DEBUG("%s", ctx_params.to_string().c_str());
     LOG_DEBUG("%s", default_gen_params.to_string().c_str());
 

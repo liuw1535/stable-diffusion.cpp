@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <vector>
+#include "core/ggml_tensor_utils.h"
 
 #include "model.h"
 #include "model/common/block.hpp"
@@ -128,15 +129,15 @@ struct UNetConfig {
             }
         }
 
-        LOG_DEBUG("unet: in_channels = %d, out_channels = %d, model_channels = %d, time_embed_dim = %d, context_dim = %d, adm_in_channels = %d, num_res_blocks = %d, tiny_unet = %s",
-                  config.in_channels,
-                  config.out_channels,
-                  config.model_channels,
-                  config.time_embed_dim,
-                  config.context_dim,
-                  config.adm_in_channels,
-                  config.num_res_blocks,
-                  config.tiny_unet ? "true" : "false");
+        LOG_VERBOSE("unet: in_channels = %d, out_channels = %d, model_channels = %d, time_embed_dim = %d, context_dim = %d, adm_in_channels = %d, num_res_blocks = %d, tiny_unet = %s",
+                    config.in_channels,
+                    config.out_channels,
+                    config.model_channels,
+                    config.time_embed_dim,
+                    config.context_dim,
+                    config.adm_in_channels,
+                    config.num_res_blocks,
+                    config.tiny_unet ? "true" : "false");
         return config;
     }
 };
@@ -586,7 +587,9 @@ public:
             label_emb      = ggml_silu_inplace(ctx->ggml_ctx, label_emb);
             label_emb      = label_embed_2->forward(ctx, label_emb);  // [N, time_embed_dim]
 
-            emb = ggml_add(ctx->ggml_ctx, emb, label_emb);  // [N, time_embed_dim]
+            emb = label_emb->ne[1] > emb->ne[1]
+                      ? ggml_add(ctx->ggml_ctx, label_emb, emb)
+                      : ggml_add(ctx->ggml_ctx, emb, label_emb);  // [N, time_embed_dim]
         }
         // sd::ggml_graph_cut::mark_graph_cut(emb, "unet.prelude", "emb");
 
@@ -775,14 +778,17 @@ struct UNetModelRunner : public DiffusionModelRunner {
                              const sd::Tensor<float>& y_tensor                     = {},
                              int num_video_frames                                  = -1,
                              const std::vector<sd::Tensor<float>>& controls_tensor = {},
-                             float control_strength                                = 0.f) {
+                             float control_strength                                = 0.f,
+                             const sd::Tensor<float>& ip_context_tensor            = {},
+                             float ip_scale                                        = 1.f) {
         ggml_cgraph* gf = new_graph_custom(UNET_GRAPH_SIZE);
 
-        ggml_tensor* x         = make_input(x_tensor);
-        ggml_tensor* timesteps = make_input(timesteps_tensor);
-        ggml_tensor* context   = make_optional_input(context_tensor);
-        ggml_tensor* c_concat  = make_optional_input(c_concat_tensor);
-        ggml_tensor* y         = make_optional_input(y_tensor);
+        ggml_tensor* x          = make_input(x_tensor);
+        ggml_tensor* timesteps  = make_input(timesteps_tensor);
+        ggml_tensor* context    = make_optional_input(context_tensor);
+        ggml_tensor* c_concat   = make_optional_input(c_concat_tensor);
+        ggml_tensor* y          = make_optional_input(y_tensor);
+        ggml_tensor* ip_context = make_optional_input(ip_context_tensor);
         std::vector<ggml_tensor*> controls;
         controls.reserve(controls_tensor.size());
         for (const auto& control_tensor : controls_tensor) {
@@ -793,7 +799,9 @@ struct UNetModelRunner : public DiffusionModelRunner {
             num_video_frames = static_cast<int>(x->ne[3]);
         }
 
-        auto runner_ctx = get_context();
+        auto runner_ctx       = get_context();
+        runner_ctx.ip_context = ip_context;
+        runner_ctx.ip_scale   = ip_scale;
 
         ggml_tensor* out = unet.forward(&runner_ctx,
                                         x,
@@ -818,17 +826,19 @@ struct UNetModelRunner : public DiffusionModelRunner {
                               const sd::Tensor<float>& y                     = {},
                               int num_video_frames                           = -1,
                               const std::vector<sd::Tensor<float>>& controls = {},
-                              float control_strength                         = 0.f) {
+                              float control_strength                         = 0.f,
+                              const sd::Tensor<float>& ip_context            = {},
+                              float ip_scale                                 = 1.f) {
         // x: [N, in_channels, h, w]
         // timesteps: [N, ]
         // context: [N, max_position, hidden_size]([N, 77, 768]) or [1, max_position, hidden_size]
         // c_concat: [N, in_channels, h, w] or [1, in_channels, h, w]
         // y: [N, adm_in_channels] or [1, adm_in_channels]
         auto get_graph = [&]() -> ggml_cgraph* {
-            return build_graph(x, timesteps, context, c_concat, y, num_video_frames, controls, control_strength);
+            return build_graph(x, timesteps, context, c_concat, y, num_video_frames, controls, control_strength, ip_context, ip_scale);
         };
 
-        return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false), x.dim());
+        return restore_trailing_singleton_dims(GGMLRunner::compute(get_graph, n_threads, false), x.dim());
     }
 
     sd::Tensor<float> compute(int n_threads,
@@ -845,7 +855,9 @@ struct UNetModelRunner : public DiffusionModelRunner {
                        tensor_or_empty(diffusion_params.y),
                        extra->num_video_frames,
                        extra->controls ? *extra->controls : empty_controls,
-                       extra->control_strength);
+                       extra->control_strength,
+                       extra->ip_context ? *extra->ip_context : sd::Tensor<float>{},
+                       extra->ip_scale);
     }
 
     void test() {
@@ -895,7 +907,7 @@ struct UNetModelRunner : public DiffusionModelRunner {
             GGML_ASSERT(!out_opt.empty());
             out = std::move(out_opt);
             print_sd_tensor(out);
-            LOG_DEBUG("unet test done in %lldms", t1 - t0);
+            LOG_VERBOSE("unet test done in %lldms", t1 - t0);
         }
     }
 };

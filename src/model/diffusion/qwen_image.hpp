@@ -2,6 +2,8 @@
 #define __SD_MODEL_DIFFUSION_QWEN_IMAGE_HPP__
 
 #include <memory>
+#include "core/ggml_extend_backend.h"
+#include "core/ggml_tensor_utils.h"
 
 #include "core/util.h"
 #include "model/common/block.hpp"
@@ -49,9 +51,9 @@ namespace Qwen {
                     }
                 }
             }
-            LOG_DEBUG("qwen_image: num_layers = %d, zero_cond_t = %s",
-                      config.num_layers,
-                      config.zero_cond_t ? "true" : "false");
+            LOG_VERBOSE("qwen_image: num_layers = %d, zero_cond_t = %s",
+                        config.num_layers,
+                        config.zero_cond_t ? "true" : "false");
             return config;
         }
     };
@@ -103,9 +105,9 @@ namespace Qwen {
             }
         }
 
-        ggml_tensor* forward(GGMLRunnerContext* ctx,
-                             ggml_tensor* timesteps,
-                             ggml_tensor* addition_t_cond = nullptr) {
+        virtual ggml_tensor* forward(GGMLRunnerContext* ctx,
+                                     ggml_tensor* timesteps,
+                                     ggml_tensor* addition_t_cond = nullptr) {
             // timesteps: [N,]
             // return: [N, embedding_dim]
             auto timestep_embedder = std::dynamic_pointer_cast<TimestepEmbedding>(blocks["timestep_embedder"]);
@@ -416,10 +418,14 @@ namespace Qwen {
 
     public:
         QwenImageModel() {}
-        QwenImageModel(QwenImageConfig config)
+        QwenImageModel(QwenImageConfig config,
+                       std::shared_ptr<QwenTimestepProjEmbeddings> time_text_embed = nullptr)
             : config(config) {
-            int64_t inner_dim         = config.num_attention_heads * config.attention_head_dim;
-            blocks["time_text_embed"] = std::shared_ptr<GGMLBlock>(new QwenTimestepProjEmbeddings(inner_dim, config.use_additional_t_cond));
+            int64_t inner_dim = config.num_attention_heads * config.attention_head_dim;
+            if (time_text_embed == nullptr) {
+                time_text_embed = std::make_shared<QwenTimestepProjEmbeddings>(inner_dim, config.use_additional_t_cond);
+            }
+            blocks["time_text_embed"] = std::move(time_text_embed);
             blocks["txt_norm"]        = std::shared_ptr<GGMLBlock>(new RMSNorm(config.joint_attention_dim, 1e-6f));
             blocks["img_in"]          = std::shared_ptr<GGMLBlock>(new Linear(config.in_channels, inner_dim));
             blocks["txt_in"]          = std::shared_ptr<GGMLBlock>(new Linear(config.joint_attention_dim, inner_dim));
@@ -629,20 +635,18 @@ namespace Qwen {
                 ref_index_mode = Rope::RefIndexMode::DECREASE;
             }
 
-            pe_vec      = Rope::gen_qwen_image_pe(time_len,
-                                                  static_cast<int>(x->ne[1]),
-                                                  static_cast<int>(x->ne[0]),
-                                                  config.patch_size,
-                                                  batch_size,
-                                                  static_cast<int>(context->ne[1]),
-                                                  ref_latents,
-                                                  ref_index_mode,
-                                                  config.theta,
-                                                  circular_y_enabled,
-                                                  circular_x_enabled,
-                                                  config.axes_dim);
+            pe_vec      = finish_rope_pe(Rope::gen_qwen_image_pe(time_len,
+                                                                 static_cast<int>(x->ne[1]),
+                                                                 static_cast<int>(x->ne[0]),
+                                                                 config.patch_size,
+                                                                 batch_size,
+                                                                 static_cast<int>(context->ne[1]),
+                                                                 ref_latents,
+                                                                 ref_index_mode,
+                                                                 config.theta,
+                                                                 config.axes_dim));
             int pos_len = static_cast<int>(pe_vec.size() / config.axes_dim_sum / 2);
-            // LOG_DEBUG("pos_len %d", pos_len);
+            // LOG_VERBOSE("pos_len %d", pos_len);
             auto pe = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, config.axes_dim_sum / 2, pos_len);
             // pe->data = pe_vec.data();
             // print_ggml_tensor(pe, true, "pe");
@@ -703,7 +707,7 @@ namespace Qwen {
                 return build_graph(x, timesteps, context, ref_latents, ref_index_mode);
             };
 
-            return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false), x.dim());
+            return restore_trailing_singleton_dims(GGMLRunner::compute(get_graph, n_threads, false), x.dim());
         }
 
         sd::Tensor<float> compute(int n_threads,
@@ -756,7 +760,7 @@ namespace Qwen {
                 GGML_ASSERT(!out_opt.empty());
                 out = std::move(out_opt);
                 print_sd_tensor(out);
-                LOG_DEBUG("qwen_image test done in %lldms", t1 - t0);
+                LOG_VERBOSE("qwen_image test done in %lldms", t1 - t0);
             }
         }
 
@@ -767,8 +771,8 @@ namespace Qwen {
             ggml_backend_t backend    = sd_backend_cpu_init();
             ggml_type model_data_type = GGML_TYPE_Q8_0;
 
-            auto model_manager        = std::make_shared<ModelManager>();
-            ModelLoader& model_loader = model_manager->loader();
+            auto model_manager = std::make_shared<ModelManager>();
+            ModelLoader model_loader;
             if (!model_loader.init_from_file_and_convert_name(file_path, "model.diffusion_model.")) {
                 LOG_ERROR("init model loader from file failed: '%s'", file_path.c_str());
                 return;
@@ -787,7 +791,8 @@ namespace Qwen {
                                                                                             VERSION_QWEN_IMAGE,
                                                                                             model_manager);
 
-            if (!model_manager->register_runner_params("Qwen image test",
+            if (!model_manager->set_loader(model_loader) ||
+                !model_manager->register_runner_params(ModelComponent::Diffusion,
                                                        *qwen_image,
                                                        "model.diffusion_model",
                                                        ModelManager::ResidencyMode::ParamBackend,

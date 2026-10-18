@@ -3,12 +3,14 @@
 
 #include <array>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
 
 #include "core/tensor.hpp"
+#include "ggml-backend.h"
 #include "ggml.h"
 
 namespace sd {
@@ -54,10 +56,28 @@ namespace sd {
             GGML_ABORT("ggml tensor type does not match sd::Tensor type");
         }
         Tensor<T> result(shape_from_ggml(tensor));
-        if (tensor->buffer != nullptr) {
-            ggml_backend_tensor_get(tensor, result.data(), 0, ggml_nbytes(tensor));
+        std::vector<uint8_t> strided_data;
+        void* destination = result.data();
+        if (!ggml_is_contiguous(tensor)) {
+            strided_data.resize(ggml_nbytes(tensor));
+            destination = strided_data.data();
+        }
+        auto buffer = tensor->view_src != nullptr ? tensor->view_src->buffer : tensor->buffer;
+        if (buffer != nullptr) {
+            ggml_backend_tensor_get(tensor, destination, 0, ggml_nbytes(tensor));
         } else {
-            std::memcpy(result.data(), tensor->data, ggml_nbytes(tensor));
+            std::memcpy(destination, tensor->data, ggml_nbytes(tensor));
+        }
+        if (!strided_data.empty()) {
+            for (int64_t i = 0; i < result.numel(); ++i) {
+                int64_t index = i;
+                size_t offset = 0;
+                for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                    offset += static_cast<size_t>(index % tensor->ne[d]) * tensor->nb[d];
+                    index /= tensor->ne[d];
+                }
+                std::memcpy(result.data() + i, strided_data.data() + offset, sizeof(T));
+            }
         }
         return result;
     }
@@ -86,7 +106,7 @@ namespace sd {
 
     template <typename T>
     inline Tensor<T> load_tensor_from_file_as_tensor(const std::string& file_path) {
-        std::ifstream file(file_path, std::ios::binary);
+        std::ifstream file(std::filesystem::u8path(file_path), std::ios::binary);
         if (!file.is_open()) {
             throw std::runtime_error("failed to open tensor file: " + file_path);
         }

@@ -22,7 +22,7 @@ static std::string lower_ascii(std::string value) {
 }
 
 static bool is_supported_model_ext(const fs::path& p) {
-    auto ext = lower_ascii(p.extension().string());
+    auto ext = lower_ascii(p.extension().u8string());
     return ext == ".gguf" || ext == ".pt" || ext == ".pth" || ext == ".safetensors";
 }
 
@@ -199,7 +199,6 @@ ArgOptions SDSvrParams::get_options() {
     };
 
     options.bool_options = {
-        {"-v", "--verbose", "print extra info", true, &verbose},
         {"", "--color", "colors the logging tags according to level", true, &color},
     };
 
@@ -212,6 +211,7 @@ ArgOptions SDSvrParams::get_options() {
     options.manual_options = {
         {"-h", "--help", "show this help message and exit", on_help_arg},
     };
+    add_log_options(options, log_level);
     return options;
 }
 
@@ -226,7 +226,7 @@ bool SDSvrParams::validate() {
         return false;
     }
 
-    if (!serve_html_path.empty() && !fs::exists(serve_html_path)) {
+    if (!serve_html_path.empty() && !fs::exists(fs::u8path(serve_html_path))) {
         LOG_ERROR("error: serve_html_path file does not exist: %s", serve_html_path.c_str());
         return false;
     }
@@ -243,6 +243,7 @@ bool SDSvrParams::resolve_and_validate() {
 std::string SDSvrParams::to_string() const {
     std::ostringstream oss;
     oss << "SDSvrParams {\n"
+        << "  log_level: " << log_level_name(log_level) << ",\n"
         << "  listen_ip: " << listen_ip << ",\n"
         << "  listen_port: \"" << listen_port << "\",\n"
         << "  serve_html_path: \"" << serve_html_path << "\",\n"
@@ -253,26 +254,53 @@ std::string SDSvrParams::to_string() const {
 void refresh_lora_cache(ServerRuntime& rt) {
     std::vector<LoraEntry> new_cache;
 
-    fs::path lora_dir = rt.ctx_params->lora_model_dir;
-    if (fs::exists(lora_dir) && fs::is_directory(lora_dir)) {
-        for (auto& entry : fs::recursive_directory_iterator(lora_dir, fs::directory_options::skip_permission_denied)) {
-            if (!entry.is_regular_file()) {
-                continue;
-            }
-            const fs::path& p = entry.path();
-            if (!is_supported_model_ext(p)) {
-                continue;
-            }
+    if (rt.ctx_params->lora_model_dir.empty()) {
+        std::lock_guard<std::mutex> lock(*rt.lora_mutex);
+        rt.lora_cache->clear();
+        return;
+    }
 
-            LoraEntry lora_entry;
-            lora_entry.name     = p.stem().u8string();
-            lora_entry.fullpath = p.u8string();
-            std::string rel     = p.lexically_relative(lora_dir).u8string();
-            std::replace(rel.begin(), rel.end(), '\\', '/');
-            lora_entry.path = rel;
+    fs::path lora_dir = fs::u8path(rt.ctx_params->lora_model_dir);
+    std::error_code ec;
+    if (fs::exists(lora_dir, ec) && !ec && fs::is_directory(lora_dir, ec) && !ec) {
+        try {
+            auto it = fs::recursive_directory_iterator(
+                lora_dir,
+                fs::directory_options::skip_permission_denied,
+                ec);
+            auto end = fs::recursive_directory_iterator();
+            while (!ec && it != end) {
+                std::error_code entry_ec;
+                bool is_reg = it->is_regular_file(entry_ec);
+                if (entry_ec || !is_reg) {
+                    it.increment(ec);
+                    continue;
+                }
+                const fs::path& p = it->path();
+                if (!is_supported_model_ext(p)) {
+                    it.increment(ec);
+                    continue;
+                }
 
-            new_cache.push_back(std::move(lora_entry));
+                LoraEntry lora_entry;
+                lora_entry.name     = p.stem().u8string();
+                lora_entry.fullpath = p.u8string();
+                std::string rel     = p.lexically_relative(lora_dir).u8string();
+                std::replace(rel.begin(), rel.end(), '\\', '/');
+                lora_entry.path = rel;
+
+                new_cache.push_back(std::move(lora_entry));
+                it.increment(ec);
+            }
+        } catch (const std::exception& e) {
+            LOG_WARN("error while scanning lora directory '%s': %s", lora_dir.u8string().c_str(), e.what());
+            return;
         }
+    }
+
+    if (ec) {
+        LOG_WARN("error while scanning lora directory '%s': %s", lora_dir.u8string().c_str(), ec.message().c_str());
+        return;
     }
 
     std::sort(new_cache.begin(), new_cache.end(), [](const LoraEntry& a, const LoraEntry& b) {
@@ -294,26 +322,76 @@ std::string get_lora_full_path(ServerRuntime& rt, const std::string& path) {
 
 void refresh_upscaler_cache(ServerRuntime& rt) {
     std::vector<UpscalerEntry> new_cache;
+    std::vector<UpscalerEntry> previous_cache;
+    {
+        std::lock_guard<std::mutex> lock(*rt.upscaler_mutex);
+        previous_cache = *rt.upscaler_cache;
+    }
 
-    fs::path upscaler_dir = rt.ctx_params->hires_upscalers_dir;
-    if (fs::exists(upscaler_dir) && fs::is_directory(upscaler_dir)) {
-        for (auto& entry : fs::directory_iterator(upscaler_dir)) {
-            if (!entry.is_regular_file()) {
-                continue;
+    fs::path upscaler_dir = fs::u8path(rt.ctx_params->hires_upscalers_dir);
+    std::error_code ec;
+    if (fs::exists(upscaler_dir, ec) && !ec && fs::is_directory(upscaler_dir, ec) && !ec) {
+        try {
+            auto it = fs::directory_iterator(
+                upscaler_dir,
+                fs::directory_options::skip_permission_denied,
+                ec);
+            auto end = fs::directory_iterator();
+            while (!ec && it != end) {
+                std::error_code entry_ec;
+                bool is_reg = it->is_regular_file(entry_ec);
+                if (entry_ec || !is_reg) {
+                    it.increment(ec);
+                    continue;
+                }
+                const fs::path& p = it->path();
+                if (!is_supported_model_ext(p)) {
+                    it.increment(ec);
+                    continue;
+                }
+
+                UpscalerEntry upscaler_entry;
+                upscaler_entry.name = p.stem().u8string();
+                std::error_code abs_ec;
+                fs::path abs_path         = fs::absolute(p, abs_ec);
+                upscaler_entry.fullpath   = (abs_ec ? p : abs_path.lexically_normal()).u8string();
+                upscaler_entry.model_name = "ESRGAN_4x";
+                upscaler_entry.path       = p.filename().u8string();
+
+                std::error_code size_ec;
+                upscaler_entry.file_size = it->file_size(size_ec);
+                if (size_ec) {
+                    it.increment(ec);
+                    continue;
+                }
+
+                std::error_code time_ec;
+                upscaler_entry.last_modified        = it->last_write_time(time_ec);
+                auto previous                       = std::find_if(previous_cache.begin(), previous_cache.end(), [&](const UpscalerEntry& cached) {
+                    return cached.fullpath == upscaler_entry.fullpath &&
+                           cached.file_size == upscaler_entry.file_size &&
+                           (!time_ec && cached.last_modified == upscaler_entry.last_modified);
+                });
+                upscaler_entry.image_upscale_factor = previous != previous_cache.end()
+                                                          ? previous->image_upscale_factor
+                                                          : get_upscaler_model_scale(upscaler_entry.fullpath.c_str());
+                if (upscaler_entry.image_upscale_factor > 0) {
+                    upscaler_entry.scale      = upscaler_entry.image_upscale_factor;
+                    upscaler_entry.model_name = "ESRGAN_" + std::to_string(upscaler_entry.scale) + "x";
+                }
+
+                new_cache.push_back(std::move(upscaler_entry));
+                it.increment(ec);
             }
-            const fs::path& p = entry.path();
-            if (!is_supported_model_ext(p)) {
-                continue;
-            }
-
-            UpscalerEntry upscaler_entry;
-            upscaler_entry.name       = p.stem().u8string();
-            upscaler_entry.fullpath   = fs::absolute(p).lexically_normal().u8string();
-            upscaler_entry.model_name = "ESRGAN_4x";
-            upscaler_entry.path       = p.filename().u8string();
-
-            new_cache.push_back(std::move(upscaler_entry));
+        } catch (const std::exception& e) {
+            LOG_WARN("error while scanning upscalers directory '%s': %s", upscaler_dir.u8string().c_str(), e.what());
+            return;
         }
+    }
+
+    if (ec) {
+        LOG_WARN("error while scanning upscalers directory '%s': %s", upscaler_dir.u8string().c_str(), ec.message().c_str());
+        return;
     }
 
     std::sort(new_cache.begin(), new_cache.end(), [](const UpscalerEntry& a, const UpscalerEntry& b) {

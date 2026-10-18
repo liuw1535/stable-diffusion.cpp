@@ -103,7 +103,27 @@ std::string convert_open_clip_to_hf_clip_name(std::string name) {
     return name;
 }
 
-std::string convert_cond_stage_model_name(std::string name, std::string prefix) {
+std::string convert_llada2_moe_te_name(std::string name);
+
+static std::string convert_ming_image_te_name(std::string name) {
+    if (name == "llm.query_tokens") {
+        name = "llm.query_tokens_dict.16x16";
+    }
+    static const std::vector<std::pair<std::string, std::string>> name_map = {
+        {"thinker.", "backbone."},
+        {"attention.", "self_attn."},
+        {"self_attn.dense.", "self_attn.o_proj."},
+        {"gate.proj.", "gate."},
+    };
+    replace_with_name_map(name, name_map);
+    return name;
+}
+
+std::string convert_cond_stage_model_name(std::string name, std::string prefix, SDVersion version) {
+    if (version == VERSION_MING_IMAGE && prefix == "text_encoders." && starts_with(name, "llm.")) {
+        name = convert_ming_image_te_name(name);
+    }
+
     static const std::vector<std::pair<std::string, std::string>> clip_name_map{
         {"transformer.text_projection.weight", "transformer.text_model.text_projection"},
         {"model.text_projection.weight", "transformer.text_model.text_projection"},
@@ -149,6 +169,7 @@ std::string convert_cond_stage_model_name(std::string name, std::string prefix) 
         {"ffn_up.", "mlp.up_proj."},
         {"ffn_post_norm.", "post_ffw_norm."},
         {"ffn_norm.", "post_attention_layernorm."},
+        {"layer_output_scale.weight", "layer_scalar"},
         {"output_norm.", "model.norm."},
     };
 
@@ -176,6 +197,7 @@ std::string convert_cond_stage_model_name(std::string name, std::string prefix) 
             replace_with_name_map(name, llm_vision_name_map);
         } else {
             replace_with_name_map(name, llm_name_map);
+            name = convert_llada2_moe_te_name(name);
         }
     } else {
         name = convert_open_clip_to_hf_clip_name(name);
@@ -185,6 +207,20 @@ std::string convert_cond_stage_model_name(std::string name, std::string prefix) 
 }
 
 std::string convert_qwen3_vl_vision_name(std::string name) {
+    static const std::vector<std::pair<std::string, std::string>> qwen3_vl_deepstack_name_map{
+        {"v.deepstack_merger_list.", "deepstack_merger_list."},
+        {"v.deepstack.5.", "deepstack_merger_list.0."},
+        {"v.deepstack.8.", "deepstack_merger_list.0."},
+        {"v.deepstack.11.", "deepstack_merger_list.1."},
+        {"v.deepstack.16.", "deepstack_merger_list.1."},
+        {"v.deepstack.17.", "deepstack_merger_list.2."},
+        {"v.deepstack.24.", "deepstack_merger_list.2."},
+        {"fc1.", "linear_fc1."},
+        {"fc2.", "linear_fc2."},
+        {"ffn_up.", "linear_fc1."},
+        {"ffn_down.", "linear_fc2."},
+        {"ffn_norm.", "norm."},
+    };
     static const std::vector<std::pair<std::string, std::string>> qwen3_vl_vision_name_map{
         {"mm.0.", "merger.linear_fc1."},
         {"mm.2.", "merger.linear_fc2."},
@@ -201,6 +237,10 @@ std::string convert_qwen3_vl_vision_name(std::string name) {
         {"ln1.", "norm1."},
         {"ln2.", "norm2."},
     };
+    if (contains(name, "v.deepstack_merger_list.") || contains(name, "v.deepstack.")) {
+        replace_with_name_map(name, qwen3_vl_deepstack_name_map);
+        return name;
+    }
     replace_with_name_map(name, qwen3_vl_vision_name_map);
     return name;
 }
@@ -730,6 +770,52 @@ std::string convert_hunyuan_video_to_original_flux(std::string name) {
     return name;
 }
 
+// LLaDA-Image's LLaDA2-MoE text encoder. Both published layouts use these names; the ComfyUI
+// GGUF repack differs only by appending ".weight" to the bare 3-D expert parameters.
+// Called with the "text_encoders." prefix already stripped, so the name still carries "llm.".
+std::string convert_llada2_moe_te_name(std::string name) {
+    static const std::vector<std::pair<std::string, std::string>> name_map = {
+        {"model.language_model.word_embeddings.", "model.embed_tokens."},
+        {"model.language_model.norm.", "model.norm."},
+        {"model.language_model.lm_head.", "lm_head."},
+        {"model.language_model.layers.", "model.layers."},
+        {"attention.query_key_value.", "self_attn.query_key_value."},
+        {"attention.dense.", "self_attn.o_proj."},
+        {"attention.query_layernorm.", "self_attn.q_norm."},
+        {"attention.key_layernorm.", "self_attn.k_norm."},
+    };
+    replace_with_name_map(name, name_map);
+
+    // The HF checkpoint stores the stacked experts as bare nn.Parameters with no ".weight".
+    static const std::vector<std::string> bare_expert_params = {
+        "mlp.experts.gate_proj",
+        "mlp.experts.up_proj",
+        "mlp.experts.down_proj",
+    };
+    for (const auto& suffix : bare_expert_params) {
+        if (ends_with(name, suffix)) {
+            name += ".weight";
+            break;
+        }
+    }
+
+    return name;
+}
+
+// The attention projections keep their diffusers names (JointAttention's split_qkv mode), so
+// only the patch-size-keyed dicts need flattening. Latents arrive already patchified from the
+// Flux2 VAE, so the only patch key is 1-1.
+std::string convert_diffusers_dit_to_original_llada_image(std::string name) {
+    static const std::vector<std::pair<std::string, std::string>> prefix_map = {
+        {"all_x_embedder.1-1.", "x_embedder."},
+        {"all_final_layer.1-1.", "final_layer."},
+    };
+
+    replace_with_prefix_map(name, prefix_map);
+
+    return name;
+}
+
 std::string convert_diffusers_dit_to_original_lumina2(std::string name) {
     int num_layers         = 30;
     int num_refiner_layers = 2;
@@ -738,6 +824,7 @@ std::string convert_diffusers_dit_to_original_lumina2(std::string name) {
     if (z_image_name_map.empty()) {
         z_image_name_map["all_x_embedder.2-1."]  = "x_embedder.";
         z_image_name_map["all_final_layer.2-1."] = "final_layer.";
+        z_image_name_map["all_x_embedder.16-1."] = "x_embedder.";
 
         // --- transformer blocks ---
         auto add_attention_map = [&](const std::string& prefix, int num) {
@@ -864,6 +951,97 @@ static bool is_diffusers_controlnet_name(const std::string& name) {
     return false;
 }
 
+static std::string convert_diffusers_dit_to_original_pixart(std::string name) {
+    static const std::vector<std::pair<std::string, std::string>> prefix_map = {
+        {"pos_embed.proj.", "x_embedder.proj."},
+        {"adaln_single.emb.timestep_embedder.linear_1.", "t_embedder.mlp.0."},
+        {"adaln_single.emb.timestep_embedder.linear_2.", "t_embedder.mlp.2."},
+        {"adaln_single.emb.resolution_embedder.linear_1.", "csize_embedder.mlp.0."},
+        {"adaln_single.emb.resolution_embedder.linear_2.", "csize_embedder.mlp.2."},
+        {"adaln_single.emb.aspect_ratio_embedder.linear_1.", "ar_embedder.mlp.0."},
+        {"adaln_single.emb.aspect_ratio_embedder.linear_2.", "ar_embedder.mlp.2."},
+        {"adaln_single.linear.", "t_block.1."},
+        {"caption_projection.linear_1.", "y_embedder.y_proj.fc1."},
+        {"caption_projection.linear_2.", "y_embedder.y_proj.fc2."},
+        {"proj_out.", "final_layer.linear."},
+    };
+    for (const auto& entry : prefix_map) {
+        if (starts_with(name, entry.first)) {
+            return entry.second + name.substr(entry.first.size());
+        }
+    }
+    if (name == "scale_shift_table") {
+        return "final_layer.scale_shift_table";
+    }
+    const std::string block_prefix = "transformer_blocks.";
+    if (!starts_with(name, block_prefix)) {
+        return name;
+    }
+    const size_t block_end = name.find('.', block_prefix.size());
+    if (block_end == std::string::npos) {
+        return name;
+    }
+    const std::string prefix                                                = "blocks." + name.substr(block_prefix.size(), block_end - block_prefix.size()) + ".";
+    name                                                                    = name.substr(block_end + 1);
+    static const std::vector<std::pair<std::string, std::string>> block_map = {
+        {"attn1.to_q.", "attn.qkv."},
+        {"attn1.to_out.0.", "attn.proj."},
+        {"attn2.to_q.", "cross_attn.q_linear."},
+        {"attn2.to_k.", "cross_attn.kv_linear."},
+        {"attn2.to_out.0.", "cross_attn.proj."},
+        {"ff.net.0.proj.", "mlp.fc1."},
+        {"ff.net.2.", "mlp.fc2."},
+    };
+    for (const auto& entry : block_map) {
+        if (starts_with(name, entry.first)) {
+            return prefix + entry.second + name.substr(entry.first.size());
+        }
+    }
+    static const std::vector<std::pair<std::string, std::string>> part_map = {
+        {"attn1.to_k.weight", "attn.qkv.weight.1"},
+        {"attn1.to_k.bias", "attn.qkv.bias.1"},
+        {"attn1.to_v.weight", "attn.qkv.weight.2"},
+        {"attn1.to_v.bias", "attn.qkv.bias.2"},
+        {"attn2.to_v.weight", "cross_attn.kv_linear.weight.1"},
+        {"attn2.to_v.bias", "cross_attn.kv_linear.bias.1"},
+    };
+    for (const auto& entry : part_map) {
+        if (name == entry.first || starts_with(name, entry.first + ".")) {
+            return prefix + entry.second + name.substr(entry.first.size());
+        }
+    }
+    return prefix + name;
+}
+
+static std::string convert_ming_image_dit_name(std::string name) {
+    static const std::vector<std::pair<std::string, std::string>> name_map = {
+        {"all_x_embedder.2-1.", "x_embedder."},
+        {"all_final_layer.2-1.", "final_layer."},
+        {"attention.norm_q.", "attention.q_norm."},
+        {"attention.norm_k.", "attention.k_norm."},
+    };
+    replace_with_name_map(name, name_map);
+    return name;
+}
+
+std::string convert_diffusers_dit_to_original_minimax_h3(std::string name) {
+    static const std::vector<std::pair<std::string, std::string>> prefix_map = {
+        {"transformer_blocks.", "blocks."},
+        {"token_refiner.refiner_blocks.", "token_refiner.blocks."},
+    };
+    static const std::vector<std::pair<std::string, std::string>> name_map = {
+        {".attn.to_q.weight", ".attn.qkv_proj.weight"},
+        {".attn.to_k.weight", ".attn.qkv_proj.weight.1"},
+        {".attn.to_v.weight", ".attn.qkv_proj.weight.2"},
+        {".attn.to_out.0.", ".attn.out_proj."},
+        {".ff.net.0.proj.", ".mlp.fc1."},
+        {".ff.net.2.", ".mlp.fc2."},
+    };
+    replace_with_prefix_map(name, prefix_map);
+    replace_with_name_map(name, name_map);
+    return name;
+}
+
 std::string convert_diffusion_model_name(std::string name, std::string prefix, SDVersion version) {
     if (sd_version_is_sd1(version) || sd_version_is_sd2(version)) {
         name = convert_diffusers_unet_to_original_sd1(name);
@@ -875,12 +1053,20 @@ std::string convert_diffusion_model_name(std::string name, std::string prefix, S
         name = convert_diffusers_dit_to_original_flux(name);
     } else if (sd_version_is_hunyuan_video(version)) {
         name = convert_hunyuan_video_to_original_flux(name);
-    } else if (sd_version_is_z_image(version)) {
+    } else if (version == VERSION_MING_IMAGE) {
+        name = convert_ming_image_dit_name(name);
+    } else if (sd_version_is_z_image(version) || sd_version_is_z_image_l2p(version)) {
         name = convert_diffusers_dit_to_original_lumina2(name);
+    } else if (sd_version_is_llada_image(version)) {
+        name = convert_diffusers_dit_to_original_llada_image(name);
     } else if (sd_version_is_anima(version)) {
         name = convert_other_dit_to_original_anima(name);
     } else if (sd_version_is_krea2(version)) {
         name = convert_diffusers_dit_to_original_krea2(name);
+    } else if (sd_version_is_pixart(version)) {
+        name = convert_diffusers_dit_to_original_pixart(name);
+    } else if (sd_version_is_minimax_h3(version)) {
+        name = convert_diffusers_dit_to_original_minimax_h3(name);
     }
     return name;
 }
@@ -980,7 +1166,30 @@ std::string convert_diffusers_vae_to_original_sd1(std::string name) {
     return result;
 }
 
-std::string convert_diffusers_to_original_wan_vae(std::string name) {
+std::string convert_diffusers_to_original_wan_vae(std::string name, bool qwen_image_2_1 = false) {
+    if (qwen_image_2_1) {
+        for (int i = 0; i < 5; ++i) {
+            const auto index = std::to_string(i);
+            for (const auto& side : {std::string("encoder"), std::string("decoder")}) {
+                const bool encoder           = side == "encoder";
+                const std::string old_prefix = side + (encoder ? ".down_blocks." : ".up_blocks.") + index + ".";
+                const std::string new_prefix = side + (encoder ? ".downsamples." : ".upsamples.") + index + ".";
+                if (!starts_with(name, old_prefix)) {
+                    continue;
+                }
+                name.replace(0, old_prefix.size(), new_prefix);
+                const std::string layers = encoder ? "downsamples." : "upsamples.";
+                for (int j = 0; j < (encoder ? 2 : 3); ++j) {
+                    const auto old_resnet = new_prefix + "resnets." + std::to_string(j) + ".";
+                    const auto new_resnet = new_prefix + layers + std::to_string(j) + ".";
+                    replace_with_prefix_map(name, std::vector<std::pair<std::string, std::string>>{{old_resnet + "conv_shortcut.", new_resnet + "shortcut."},
+                                                                                                   {old_resnet, new_resnet + "residual."}});
+                }
+                replace_with_prefix_map(name, std::vector<std::pair<std::string, std::string>>{{new_prefix + (encoder ? "downsampler." : "upsampler."),
+                                                                                                new_prefix + layers + (encoder ? "2." : "3.")}});
+            }
+        }
+    }
     static const std::vector<std::pair<std::string, std::string>> prefix_map = {
         {"quant_conv.", "conv1."},
         {"post_quant_conv.", "conv2."},
@@ -1036,7 +1245,11 @@ std::string convert_diffusers_to_original_wan_vae(std::string name) {
     };
 
     replace_with_name_map(name, shared_name_map);
-    replace_with_prefix_map(name, prefix_map);
+    if (qwen_image_2_1) {
+        replace_with_prefix_map(name, std::vector<std::pair<std::string, std::string>>{{"quant_conv.", "conv1."}, {"post_quant_conv.", "conv2."}});
+    } else {
+        replace_with_prefix_map(name, prefix_map);
+    }
 
     // Only apply the ResNet-specific renaming if the tensor belongs to a ResNet block.
     // This prevents generic ".conv1." or ".conv2." matching on top-level encoder/decoder convolutions.
@@ -1048,11 +1261,11 @@ std::string convert_diffusers_to_original_wan_vae(std::string name) {
 }
 
 std::string convert_first_stage_model_name(std::string name, std::string prefix, SDVersion version) {
-    if (sd_version_is_hunyuan_video(version)) {
+    if (sd_version_is_hunyuan_video(version) || sd_version_is_mage_flow(version) || sd_version_is_minimax_h3(version)) {
         return name;
     }
     if (sd_version_uses_wan_vae(version)) {
-        return convert_diffusers_to_original_wan_vae(name);
+        return convert_diffusers_to_original_wan_vae(name, version == VERSION_QWEN_IMAGE_2_1);
     }
     static std::unordered_map<std::string, std::string> vae_name_map = {
         {"decoder.post_quant_conv.", "post_quant_conv."},
@@ -1181,6 +1394,7 @@ std::string convert_sep_to_dot(std::string name) {
         "x_embedder",
         "cross_attn",
         "output_proj",
+        "token_refiner",
     };
 
     // record the positions of underscores that should NOT be replaced
@@ -1251,9 +1465,8 @@ bool is_first_stage_model_name(const std::string& name) {
 }
 
 static std::string convert_esrgan_tensor_name(std::string name) {
-    static std::unordered_map<std::string, std::string> esrgan_name_map;
-
-    if (esrgan_name_map.empty()) {
+    static const auto esrgan_name_map = [] {
+        std::unordered_map<std::string, std::string> esrgan_name_map;
         esrgan_name_map["model.0."] = "conv_first.";
 
         constexpr int max_num_blocks = 64;
@@ -1279,15 +1492,59 @@ static std::string convert_esrgan_tensor_name(std::string name) {
         esrgan_name_map["model.7."]  = "conv_last.";
         esrgan_name_map["model.8."]  = "conv_hr.";
         esrgan_name_map["model.10."] = "conv_last.";
-    }
+        return esrgan_name_map;
+    }();
 
     replace_with_prefix_map(name, esrgan_name_map);
+    return name;
+}
+
+static const std::map<int, std::string>& ip_adapter_index_map(SDVersion version) {
+    static const std::map<int, std::string> sd15_map = {
+        {1, "input_blocks.1.1.transformer_blocks.0"}, {3, "input_blocks.2.1.transformer_blocks.0"}, {5, "input_blocks.4.1.transformer_blocks.0"}, {7, "input_blocks.5.1.transformer_blocks.0"}, {9, "input_blocks.7.1.transformer_blocks.0"}, {11, "input_blocks.8.1.transformer_blocks.0"}, {13, "output_blocks.3.1.transformer_blocks.0"}, {15, "output_blocks.4.1.transformer_blocks.0"}, {17, "output_blocks.5.1.transformer_blocks.0"}, {19, "output_blocks.6.1.transformer_blocks.0"}, {21, "output_blocks.7.1.transformer_blocks.0"}, {23, "output_blocks.8.1.transformer_blocks.0"}, {25, "output_blocks.9.1.transformer_blocks.0"}, {27, "output_blocks.10.1.transformer_blocks.0"}, {29, "output_blocks.11.1.transformer_blocks.0"}, {31, "middle_block.1.transformer_blocks.0"}};
+
+    static std::map<int, std::string> sdxl_map;
+    if (sdxl_map.empty()) {
+        std::vector<std::pair<std::string, int>> order = {
+            {"input_blocks.4.1", 2}, {"input_blocks.5.1", 2}, {"input_blocks.7.1", 10}, {"input_blocks.8.1", 10}, {"output_blocks.0.1", 10}, {"output_blocks.1.1", 10}, {"output_blocks.2.1", 10}, {"output_blocks.3.1", 2}, {"output_blocks.4.1", 2}, {"output_blocks.5.1", 2}, {"middle_block.1", 10}};
+        int idx = 1;
+        for (const auto& [block, depth] : order) {
+            for (int m = 0; m < depth; m++) {
+                sdxl_map[idx] = block + ".transformer_blocks." + std::to_string(m);
+                idx += 2;
+            }
+        }
+    }
+    return sd_version_is_sdxl(version) ? sdxl_map : sd15_map;
+}
+
+static std::string convert_ip_adapter_name(std::string name, SDVersion version) {
+    if (starts_with(name, "image_proj.")) {
+        return "ip_adapter." + name;
+    }
+    if (starts_with(name, "ip_adapter.")) {
+        auto items = split_string(name, '.');
+        if (items.size() < 4) {
+            return name;
+        }
+        int idx        = atoi(items[1].c_str());
+        const auto& mp = ip_adapter_index_map(version);
+        auto blk       = mp.find(idx);
+        if (blk == mp.end()) {
+            return name;
+        }
+        return "model.diffusion_model." + blk->second + ".attn2." + items[2] + "." + items[3];
+    }
     return name;
 }
 
 std::string convert_tensor_name(std::string name, SDVersion version) {
     if (version == VERSION_ESRGAN) {
         return convert_esrgan_tensor_name(std::move(name));
+    }
+
+    if (starts_with(name, "ip_adapter.") || starts_with(name, "image_proj.")) {
+        return convert_ip_adapter_name(std::move(name), version);
     }
 
     bool is_lora                             = false;
@@ -1341,6 +1598,8 @@ std::string convert_tensor_name(std::string name, SDVersion version) {
             {".lora_B.weight", ".weight.lora_up"},
             {".lora_A.default.weight", ".weight.lora_down"},
             {".lora_B.default.weight", ".weight.lora_up"},
+            {".lora_A", ".weight.lora_down"},
+            {".lora_B", ".weight.lora_up"},
             {".lora_linear", ".weight.alpha"},
             {".alpha", ".weight.alpha"},
             {".scale", ".weight.scale"},
@@ -1383,7 +1642,7 @@ std::string convert_tensor_name(std::string name, SDVersion version) {
             }
         }
 
-        // LOG_DEBUG("name %s %d", name.c_str(), version);
+        // LOG_VERBOSE("name %s %d", name.c_str(), version);
 
         if (sd_version_is_unet(version) || is_underline || is_lycoris_underline) {
             name = convert_sep_to_dot(name);
@@ -1395,6 +1654,7 @@ std::string convert_tensor_name(std::string name, SDVersion version) {
         {"unet.", "model.diffusion_model."},
         {"transformer.", "model.diffusion_model."},  // dit
         {"vae.", "first_stage_model."},
+        {"text_encoders.llm.text_embedding_projection.", "text_embedding_projection."},
         {"text_encoder.", "cond_stage_model.transformer."},
         {"te.", "cond_stage_model.transformer."},
         {"text_encoder.2.", "cond_stage_model.1.transformer."},
@@ -1406,16 +1666,51 @@ std::string convert_tensor_name(std::string name, SDVersion version) {
         {"te2.", "cond_stage_model.1.transformer."},
         {"te1.", "cond_stage_model.transformer."},
         {"te3.", "text_encoders.t5xxl.transformer."},
+        {"clip_vision.", "cond_stage_model.transformer."},
     };
 
     if (sd_version_is_flux(version)) {
         prefix_map["te1."] = "text_encoders.clip_l.transformer.";
     }
 
+    if (sd_version_is_unet(version)) {
+        prefix_map["clip_l."] = "cond_stage_model.transformer.";
+        prefix_map["clip_g."] = "cond_stage_model.1.transformer.";
+    } else {
+        prefix_map["clip_l."] = "text_encoders.clip_l.transformer.";
+        prefix_map["clip_g."] = "text_encoders.clip_g.transformer.";
+    }
+
     replace_with_prefix_map(name, prefix_map);
 
-    if ((sd_version_is_boogu_image(version) || sd_version_is_krea2(version)) && starts_with(name, "text_encoders.llm.visual.")) {
-        name = convert_qwen3_vl_vision_name(std::move(name));
+    if (version == VERSION_MOSS_IMAGE) {
+        const std::string te_prefix = "text_encoders.llm.";
+        if (starts_with(name, te_prefix + "blk.")) {
+            static const std::vector<std::pair<std::string, std::string>> qwen35_name_map = {
+                {"attn_post_norm.", "post_attention_layernorm."},
+                {"post_attention_norm.", "post_attention_layernorm."},
+                {"attn_qkv.", "linear_attn.in_proj_qkv."},
+                {"attn_gate.", "linear_attn.in_proj_z."},
+                {"ssm_conv1d.", "linear_attn.conv1d."},
+                {"ssm_dt.bias", "linear_attn.dt_bias"},
+                {"ssm_norm.", "linear_attn.norm."},
+                {"ssm_out.", "linear_attn.out_proj."},
+                {"ssm_alpha.", "linear_attn.in_proj_a."},
+                {"ssm_beta.", "linear_attn.in_proj_b."},
+                {"ssm_a", "linear_attn.A"},
+            };
+            replace_with_name_map(name, qwen35_name_map);
+        }
+    }
+
+    if (version == VERSION_QWEN_IMAGE_2_1 || sd_version_is_boogu_image(version) || sd_version_is_krea2(version) || sd_version_is_mage_flow(version) || sd_version_is_minimax_h3(version)) {
+        const std::string hf_vision_prefix = "text_encoders.llm.model.visual.";
+        if (starts_with(name, hf_vision_prefix)) {
+            name = "text_encoders.llm.visual." + name.substr(hf_vision_prefix.size());
+        }
+        if (starts_with(name, "text_encoders.llm.visual.")) {
+            name = convert_qwen3_vl_vision_name(std::move(name));
+        }
     }
 
     // diffusion model
@@ -1445,7 +1740,7 @@ std::string convert_tensor_name(std::string name, SDVersion version) {
     {
         for (const auto& prefix : cond_stage_model_prefix_vec) {
             if (starts_with(name, prefix)) {
-                name = convert_cond_stage_model_name(name.substr(prefix.size()), prefix);
+                name = convert_cond_stage_model_name(name.substr(prefix.size()), prefix, version);
                 name = prefix + name;
                 break;
             }
@@ -1489,6 +1784,11 @@ std::string convert_tensor_name(std::string name, SDVersion version) {
             name = convert_diffusers_controlnet_to_original_sdxl(name);
         }
     }
+
+    static const std::vector<std::pair<std::string, std::string>> generic_name_map = {
+        {".scale_weight", ".weight_scale"},
+    };
+    replace_with_name_map(name, generic_name_map);
 
     if (is_lora) {
         name = "lora." + name;

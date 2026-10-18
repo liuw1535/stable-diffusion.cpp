@@ -3,7 +3,7 @@
 The following example starts `sd-server` with a standalone diffusion model, VAE, and LLM text encoder:
 
 ```
-.\bin\Release\sd-server.exe --diffusion-model  ..\models\diffusion_models\z_image_turbo_bf16.safetensors --vae ..\models\vae\ae.sft  --llm ..\models\text_encoders\qwen_3_4b.safetensors --diffusion-fa --offload-to-cpu -v --cfg-scale 1.0
+.\bin\Release\sd-server.exe --diffusion-model  ..\models\diffusion_models\z_image_turbo_bf16.safetensors --vae ..\models\vae\ae.sft  --llm ..\models\text_encoders\qwen_3_4b.safetensors --offload-to-cpu -v --cfg-scale 1.0
 ```
 
 What this example does:
@@ -11,10 +11,14 @@ What this example does:
 * `--diffusion-model` selects the standalone diffusion model
 * `--vae` selects the VAE decoder
 * `--llm` selects the text encoder / language model used by this pipeline
-* `--diffusion-fa` enables flash attention in the diffusion model
 * `--offload-to-cpu` reduces VRAM pressure by keeping weights in RAM when possible
-* `-v` enables verbose logging
+* `-v` enables verbose logging (equivalent to `--log-level verbose`)
 * `--cfg-scale 1.0` sets the default CFG scale for generation
+
+Logging defaults to `info`. Use `--log-level <level>` to select `debug`, `verbose`,
+`info`, `warn`, or `error` (from most to least detailed). Each level includes
+messages at that level and all less detailed levels. `-v` and `--verbose` are
+equivalent to `--log-level verbose`. If repeated, the last logging option wins.
 
 After the server starts successfully:
 
@@ -124,3 +128,6 @@ For detailed command-line arguments, run:
 ```bash
 ./bin/sd-server -h
 ```
+
+For completely black or white images or videos, NaNs, and the `--linear-scale` /
+`--attn-scale` startup options, see [Troubleshooting](../../docs/troubleshooting.md).

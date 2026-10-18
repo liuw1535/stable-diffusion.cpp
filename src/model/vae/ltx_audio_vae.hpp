@@ -7,7 +7,13 @@
 #include <string>
 #include <vector>
 
-#include "core/ggml_extend.hpp"
+#include "core/ggml_extend.h"
+#include "core/ggml_extend_backend.h"
+#include "core/ggml_runner.h"
+#include "core/ggml_tensor_utils.h"
+#include "core/util.h"
+#include "model/common/ggml_block.hpp"
+#include "model/vae/audio_vae.hpp"
 #include "model_loader.h"
 #include "model_manager.h"
 
@@ -171,12 +177,12 @@ namespace LTXV {
             if (config.audio_channels != 2 || config.latent_channels != 8 || config.mel_bins != 64) {
                 return config;
             }
-            LOG_DEBUG("ltx_audio_vae: sample_rate = %d, mel_bins = %d, latent_channels = %d, latent_frequency_bins = %d, has_bwe = %s",
-                      config.sample_rate,
-                      config.mel_bins,
-                      config.latent_channels,
-                      config.latent_frequency_bins,
-                      config.has_bwe ? "true" : "false");
+            LOG_VERBOSE("ltx_audio_vae: sample_rate = %d, mel_bins = %d, latent_channels = %d, latent_frequency_bins = %d, has_bwe = %s",
+                        config.sample_rate,
+                        config.mel_bins,
+                        config.latent_channels,
+                        config.latent_frequency_bins,
+                        config.has_bwe ? "true" : "false");
             return config;
         }
     };
@@ -996,7 +1002,7 @@ namespace LTXV {
         }
     };
 
-    struct LTXAudioVAERunner : public GGMLRunner {
+    struct LTXAudioVAERunner : public AudioVAERunner {
         LTXAudioVAEConfig config;
         LTXAudioVAE model;
         std::string weight_prefix;
@@ -1006,7 +1012,7 @@ namespace LTXV {
                           const String2TensorStorage& tensor_storage_map,
                           const std::string& prefix                           = "",
                           std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
-            : GGMLRunner(backend, weight_manager),
+            : AudioVAERunner(backend, weight_manager),
               weight_prefix(prefix),
               config(LTXAudioVAEConfig::detect_from_weights(tensor_storage_map)),
               model(config) {
@@ -1017,20 +1023,20 @@ namespace LTXV {
             }
         }
 
-        void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors) {
+        void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {
             model.get_param_tensors(tensors, weight_prefix);
         }
 
-        size_t get_params_mem_size() {
+        size_t get_params_mem_size() override {
             return model.get_params_mem_size();
         }
 
-        std::string get_desc() {
+        std::string get_desc() override {
             return "ltx_audio_vae";
         }
 
         sd::Tensor<float> decode(int n_threads,
-                                 const sd::Tensor<float>& latent_tensor) {
+                                 const sd::Tensor<float>& latent_tensor) override {
             int64_t t0     = ggml_time_ms();
             auto get_graph = [&]() -> ggml_cgraph* {
                 auto latent                  = make_input(latent_tensor);
@@ -1041,10 +1047,14 @@ namespace LTXV {
                 ggml_build_forward_expand(gf, waveform);
                 return gf;
             };
-            auto result = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false), 4);
+            auto result = restore_trailing_singleton_dims(GGMLRunner::compute(get_graph, n_threads, false), 4);
             int64_t t1  = ggml_time_ms();
             LOG_INFO("ltx audio vae decode completed, taking %.2fs", (t1 - t0) * 1.0f / 1000);
             return result;
+        }
+
+        int output_sample_rate() const override {
+            return config.output_sample_rate();
         }
 
         void test(const std::string& input_path) {
@@ -1058,7 +1068,7 @@ namespace LTXV {
 
             GGML_ASSERT(!out.empty());
             print_sd_tensor(out, false, "ltx_audio_vae_out");
-            LOG_DEBUG("ltx audio vae test done in %lldms", t1 - t0);
+            LOG_VERBOSE("ltx audio vae test done in %lldms", t1 - t0);
         }
 
         static void load_from_file_and_test(const std::string& model_path,
@@ -1068,8 +1078,8 @@ namespace LTXV {
             // ggml_backend_t backend = ggml_backend_cuda_init(0);
             LOG_INFO("loading ltx audio vae from '%s'", model_path.c_str());
 
-            auto model_manager        = std::make_shared<ModelManager>();
-            ModelLoader& model_loader = model_manager->loader();
+            auto model_manager = std::make_shared<ModelManager>();
+            ModelLoader model_loader;
             if (!model_loader.init_from_file(model_path)) {
                 LOG_ERROR("init model loader from file failed: '%s'", model_path.c_str());
                 return;
@@ -1081,7 +1091,8 @@ namespace LTXV {
                                                                      prefix,
                                                                      model_manager);
 
-            if (!model_manager->register_runner_params("LTX audio VAE test",
+            if (!model_manager->set_loader(std::move(model_loader)) ||
+                !model_manager->register_runner_params(ModelComponent::AudioVAE,
                                                        *ltx_audio_vae,
                                                        ModelManager::ResidencyMode::ParamBackend,
                                                        backend,
