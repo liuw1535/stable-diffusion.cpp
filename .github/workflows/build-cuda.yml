@@ -41,12 +41,12 @@ jobs:
 
       - name: Configure (CMake + Ninja, CUDA backend)
         run: |
+          # Target the NVIDIA T4 (Turing, compute capability 7.5) used on
+          # Kaggle. 75-real emits a real cubin instead of PTX-only.
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DSD_CUDA=ON \
             -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc \
-            # Target the NVIDIA T4 (Turing, compute capability 7.5) used on
-            # Kaggle. 75-real emits a real cubin instead of PTX-only.
             -DCMAKE_CUDA_ARCHITECTURES=75-real
 
       - name: Build
