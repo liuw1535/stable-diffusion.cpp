@@ -36,7 +36,7 @@ static bool build_openai_generation_request(const httplib::Request& req,
     std::string output_format = j.value("output_format", "png");
     int output_compression    = j.value("output_compression", 100);
     int width                 = runtime.default_gen_params->width > 0 ? runtime.default_gen_params->width : 512;
-    int height                = runtime.default_gen_params->width > 0 ? runtime.default_gen_params->height : 512;
+    int height                = runtime.default_gen_params->height > 0 ? runtime.default_gen_params->height : 512;
     if (!size.empty()) {
         auto pos = size.find('x');
         if (pos != std::string::npos) {
@@ -74,7 +74,7 @@ static bool build_openai_generation_request(const httplib::Request& req,
         error_message = "invalid params";
         return false;
     }
-    return true;
+    return validate_server_img_gen_request(runtime, request, error_message);
 }
 
 static bool build_openai_edit_request(const httplib::Request& req,
@@ -163,26 +163,17 @@ static bool build_openai_edit_request(const httplib::Request& req,
         int img_h            = 0;
         int resolved_channel = 0;
         uint8_t* raw_pixels  = load_image_from_memory(
-             reinterpret_cast<const char*>(bytes.data()),
-             static_cast<int>(bytes.size()),
-             img_w, img_h, resolved_channel,
-             0, 0,
-             0);
+            reinterpret_cast<const char*>(bytes.data()),
+            static_cast<int>(bytes.size()),
+            img_w, img_h, resolved_channel,
+            0, 0,
+            0);
         if (raw_pixels == nullptr) {
             continue;
         }
 
-        const bool is_first_ref_image = request.gen_params.ref_images.empty();
         SDImageOwner image_owner({(uint32_t)img_w, (uint32_t)img_h, (uint32_t)resolved_channel, raw_pixels});
         request.gen_params.set_width_and_height_if_unset(image_owner.get().width, image_owner.get().height);
-
-        if (is_first_ref_image) {
-            request.gen_params.init_image = image_owner;
-            if (request.gen_params.init_image.get().data == nullptr) {
-                error_message = "could not allocate init image";
-                return false;
-            }
-        }
 
         request.gen_params.ref_images.push_back(std::move(image_owner));
     }
@@ -220,7 +211,7 @@ static bool build_openai_edit_request(const httplib::Request& req,
         return false;
     }
 
-    return true;
+    return validate_server_img_gen_request(runtime, request, error_message);
 }
 
 static bool execute_sync_img_gen_request(ServerRuntime& runtime,
@@ -232,12 +223,14 @@ static bool execute_sync_img_gen_request(ServerRuntime& runtime,
 
     {
         std::lock_guard<std::mutex> lock(*runtime.sd_ctx_mutex);
-        sd_image_t* raw_results = nullptr;
-        if (!generate_image(runtime.sd_ctx, &img_gen_params, &raw_results, &num_results)) {
-            raw_results = nullptr;
-            num_results = 0;
+        sd_image_generation_result_t* generated = nullptr;
+        generate_image(runtime.sd_ctx, &img_gen_params, &generated);
+        results.adopt(generated, runtime.ctx_params->lora_model_dir);
+        num_results = results.count();
+        if (!results.empty() && !apply_server_adetailer(runtime, request, img_gen_params, results)) {
+            error_message = "ADetailer failed";
+            return false;
         }
-        results.adopt(raw_results, num_results);
     }
 
     if (results.empty()) {
@@ -249,15 +242,18 @@ static bool execute_sync_img_gen_request(ServerRuntime& runtime,
 
 void register_openai_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
     ServerRuntime* runtime = &rt;
+    RuntimeRoutes routes(svr, rt);
 
-    svr.Get("/v1/models", [runtime](const httplib::Request&, httplib::Response& res) {
+    routes.get("/v1/models", [runtime](const httplib::Request&, httplib::Response& res) {
         json r;
         r["data"] = json::array();
-        r["data"].push_back({{"id", "sd-cpp-local"}, {"object", "model"}, {"owned_by", "local"}});
+        if (runtime->sd_ctx) {
+            r["data"].push_back({{"id", "sd-cpp-local"}, {"object", "model"}, {"owned_by", "local"}});
+        }
         res.set_content(r.dump(), "application/json");
     });
 
-    svr.Post("/v1/images/generations", [runtime](const httplib::Request& req, httplib::Response& res) {
+    routes.post("/v1/images/generations", [runtime](const httplib::Request& req, httplib::Response& res) {
         try {
             if (!runtime_supports_generation_mode(*runtime, IMG_GEN)) {
                 res.status = 400;
@@ -273,7 +269,7 @@ void register_openai_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 return;
             }
 
-            LOG_VERBOSE("%s\n", request.gen_params.to_string().c_str());
+            LOG_DEBUG("%s\n", request.gen_params.to_string().c_str());
 
             SDImageVec results;
             if (!execute_sync_img_gen_request(*runtime, request, results, error_message)) {
@@ -287,35 +283,34 @@ void register_openai_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             out["data"]          = json::array();
             out["output_format"] = request.output_format;
 
-            int result_count     = results.count();
-            int images_per_batch = request.gen_params.batch_count > 0 ? std::max(1, result_count / request.gen_params.batch_count) : 1;
+            int result_count = results.count();
+
             for (int i = 0; i < result_count; ++i) {
                 if (results[i].data == nullptr) {
                     continue;
                 }
                 std::string params = request.gen_params.embed_image_metadata
-                                         ? get_image_params(*runtime->ctx_params,
-                                                            request.gen_params,
-                                                            request.gen_params.seed + i / images_per_batch)
+                                         ? results.generation_info(i)
                                          : "";
                 auto image_bytes   = encode_image_to_vector(request.output_format == "jpeg"
                                                                 ? EncodedImageFormat::JPEG
                                                             : request.output_format == "webp"
                                                                 ? EncodedImageFormat::WEBP
                                                                 : EncodedImageFormat::PNG,
-                                                          results[i].data,
-                                                          results[i].width,
-                                                          results[i].height,
-                                                          results[i].channel,
-                                                          params,
-                                                          request.output_compression);
+                                                            results[i].data,
+                                                            results[i].width,
+                                                            results[i].height,
+                                                            results[i].channel,
+                                                            params,
+                                                            request.output_compression);
                 if (image_bytes.empty()) {
                     LOG_ERROR("write image to mem failed");
                     continue;
                 }
 
                 json item;
-                item["b64_json"] = base64_encode(image_bytes);
+                item["b64_json"]        = base64_encode(image_bytes);
+                item["generation_info"] = json::parse(results.generation_info(i));
                 out["data"].push_back(item);
             }
 
@@ -331,7 +326,7 @@ void register_openai_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         }
     });
 
-    svr.Post("/v1/images/edits", [runtime](const httplib::Request& req, httplib::Response& res) {
+    routes.post("/v1/images/edits", [runtime](const httplib::Request& req, httplib::Response& res) {
         try {
             if (!runtime_supports_generation_mode(*runtime, IMG_GEN)) {
                 res.status = 400;
@@ -347,7 +342,7 @@ void register_openai_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 return;
             }
 
-            LOG_VERBOSE("%s\n", request.gen_params.to_string().c_str());
+            LOG_DEBUG("%s\n", request.gen_params.to_string().c_str());
 
             SDImageVec results;
             if (!execute_sync_img_gen_request(*runtime, request, results, error_message)) {
@@ -361,26 +356,25 @@ void register_openai_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             out["data"]          = json::array();
             out["output_format"] = request.output_format;
 
-            int result_count     = results.count();
-            int images_per_batch = request.gen_params.batch_count > 0 ? std::max(1, result_count / request.gen_params.batch_count) : 1;
+            int result_count = results.count();
+
             for (int i = 0; i < result_count; ++i) {
                 if (results[i].data == nullptr) {
                     continue;
                 }
                 std::string params = request.gen_params.embed_image_metadata
-                                         ? get_image_params(*runtime->ctx_params,
-                                                            request.gen_params,
-                                                            request.gen_params.seed + i / images_per_batch)
+                                         ? results.generation_info(i)
                                          : "";
                 auto image_bytes   = encode_image_to_vector(request.output_format == "jpeg" ? EncodedImageFormat::JPEG : EncodedImageFormat::PNG,
-                                                          results[i].data,
-                                                          results[i].width,
-                                                          results[i].height,
-                                                          results[i].channel,
-                                                          params,
-                                                          request.output_compression);
+                                                            results[i].data,
+                                                            results[i].width,
+                                                            results[i].height,
+                                                            results[i].channel,
+                                                            params,
+                                                            request.output_compression);
                 json item;
-                item["b64_json"] = base64_encode(image_bytes);
+                item["b64_json"]        = base64_encode(image_bytes);
+                item["generation_info"] = json::parse(results.generation_info(i));
                 out["data"].push_back(item);
             }
 
